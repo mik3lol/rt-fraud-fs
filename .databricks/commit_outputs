@@ -2,4 +2,4 @@
 # Each line is a glob pattern; notebooks matching a pattern have their outputs committed.
 # Lines starting with ! exclude; lines starting with # are comments.
 # Outputs are committed for every notebook under notebooks/ as run evidence (synthetic data only).
-notebooks/*
+notebooks/**
