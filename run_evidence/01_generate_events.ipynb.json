@@ -1,0 +1,1422 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "b326d86e-44c3-4182-8d03-8b98bf4819d4",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Overview"
+    }
+   },
+   "source": [
+    "# 01 - Synthetic event generator (Kinesis-shaped)\n",
+    "\n",
+    "Generates **synthetic** behavioral streams for a cross-border remittance app and lands them as JSON-lines files in the UC Volume `raw_events`, one folder per \"stream\":\n",
+    "\n",
+    "| Stream | Folder | Payload highlights |\n",
+    "| --- | --- | --- |\n",
+    "| login | `raw_events/login/` | device_id, ip, geo_country, success, auth_method |\n",
+    "| otp | `raw_events/otp/` | phone, otp_channel, status (sent/failed/verified), attempt_no |\n",
+    "| screen_view | `raw_events/screen_view/` | session_id, screen_name, dwell_ms, screen_seq |\n",
+    "| transfers | `raw_events/transfers/` | transfer_id, amount_usd, corridor, payout_method, device_id, ts, **is_fraud** (label) |\n",
+    "\n",
+    "Every record uses a Kinesis envelope: `{partitionKey, sequenceNumber, approximateArrivalTimestamp, data:{...}}`.\n",
+    "\n",
+    "**Population:** ~5K customers, ~2% are \"fraudster\" accounts (account-takeover victims / mule-controlled) that, during incidents, show: new device + foreign IP, failed-login and failed-OTP bursts, rapid screen hops (sub-second dwell), then high-amount transfers to a corridor the customer never used, via cash pickup / wallet. ~25% of incidents are *partial* (weaker signal) and ~1% of legit sessions are *hard negatives* (traveling customer with new device, OTP retries, larger amounts) so the model is not trivially separable.\n",
+    "\n",
+    "**Data-quality noise (on purpose):** ~0.5% duplicate records with the same `sequenceNumber` (consumer replay) and ~0.2% malformed records (null customer_id / event_ts, negative amount) to exercise silver dedup + expectations.\n",
+    "\n",
+    "**Modes:** one-time 30-day `backfill` (idempotent via a marker file), then a `live` loop writing a micro-batch every `live_interval_seconds` for `live_duration_seconds`. No real customer data; phone numbers use the fictional 555 range and IPs the CGNAT range."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794532867464,
+     "inputWidgets": {},
+     "nuid": "3e4af6d9-b1ea-4e16-b269-9de9f4c66265",
+     "showTitle": true,
+     "startTime": 1794532866179,
+     "submitTime": 1794532863310,
+     "tableResultSettingsMap": {},
+     "title": "Parameters"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "/Volumes/mlo_serverless_stable_catalog/fraud_rt/raw_events backfill_and_live 5000 0.02\n"
+     ]
+    }
+   ],
+   "source": [
+    "dbutils.widgets.text(\"catalog\", \"mlo_serverless_stable_catalog\")\n",
+    "dbutils.widgets.text(\"schema\", \"fraud_rt\")\n",
+    "dbutils.widgets.text(\"volume\", \"raw_events\")\n",
+    "dbutils.widgets.dropdown(\"mode\", \"backfill_and_live\", [\"backfill\", \"live\", \"backfill_and_live\"])\n",
+    "dbutils.widgets.text(\"n_customers\", \"5000\")\n",
+    "dbutils.widgets.text(\"fraud_rate\", \"0.02\")\n",
+    "dbutils.widgets.text(\"backfill_days\", \"30\")\n",
+    "dbutils.widgets.text(\"live_duration_seconds\", \"60\")\n",
+    "dbutils.widgets.text(\"live_interval_seconds\", \"5\")\n",
+    "dbutils.widgets.text(\"live_sessions_per_tick\", \"40\")\n",
+    "dbutils.widgets.text(\"seed\", \"42\")\n",
+    "dbutils.widgets.dropdown(\"force_backfill\", \"false\", [\"true\", \"false\"])\n",
+    "\n",
+    "CATALOG = dbutils.widgets.get(\"catalog\")\n",
+    "SCHEMA = dbutils.widgets.get(\"schema\")\n",
+    "VOLUME = dbutils.widgets.get(\"volume\")\n",
+    "MODE = dbutils.widgets.get(\"mode\")\n",
+    "N_CUSTOMERS = int(dbutils.widgets.get(\"n_customers\"))\n",
+    "FRAUD_RATE = float(dbutils.widgets.get(\"fraud_rate\"))\n",
+    "BACKFILL_DAYS = int(dbutils.widgets.get(\"backfill_days\"))\n",
+    "LIVE_DURATION_S = int(dbutils.widgets.get(\"live_duration_seconds\"))\n",
+    "LIVE_INTERVAL_S = int(dbutils.widgets.get(\"live_interval_seconds\"))\n",
+    "LIVE_SESSIONS_PER_TICK = int(dbutils.widgets.get(\"live_sessions_per_tick\"))\n",
+    "SEED = int(dbutils.widgets.get(\"seed\"))\n",
+    "FORCE_BACKFILL = dbutils.widgets.get(\"force_backfill\") == \"true\"\n",
+    "\n",
+    "VOL_ROOT = f\"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}\"\n",
+    "STREAMS = [\"login\", \"otp\", \"screen_view\", \"transfers\"]\n",
+    "DUP_RATE = 0.005   # same sequenceNumber delivered twice (consumer replay)\n",
+    "BAD_RATE = 0.002   # malformed payloads for expectations\n",
+    "print(VOL_ROOT, MODE, N_CUSTOMERS, FRAUD_RATE)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794532873719,
+     "inputWidgets": {},
+     "nuid": "42dacafb-2ae7-4c9e-b814-feb3aa3be0ba",
+     "showTitle": true,
+     "startTime": 1794532870884,
+     "submitTime": 1794532870735,
+     "tableResultSettingsMap": {},
+     "title": "Imports, helpers and customer universe"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "customers=5000  fraudster accounts=100 (2.00%)\n"
+     ]
+    }
+   ],
+   "source": [
+    "import json, os, shutil, time, uuid\n",
+    "from collections import defaultdict\n",
+    "from datetime import datetime, timedelta, timezone\n",
+    "import numpy as np\n",
+    "\n",
+    "for d in STREAMS + [\"_staging\", \"_meta\"]:\n",
+    "    os.makedirs(f\"{VOL_ROOT}/{d}\", exist_ok=True)\n",
+    "\n",
+    "CORRIDORS = [\"US-MX\", \"US-PH\", \"US-IN\", \"US-GT\", \"US-NG\"]\n",
+    "CORRIDOR_P = [0.45, 0.20, 0.20, 0.08, 0.07]\n",
+    "PAYOUTS = [\"bank_deposit\", \"cash_pickup\", \"mobile_wallet\", \"home_delivery\"]\n",
+    "PAYOUT_P = [0.55, 0.25, 0.15, 0.05]\n",
+    "FOREIGN_GEOS = [\"RO\", \"NG\", \"VN\", \"BR\", \"UA\", \"ID\", \"RU\"]\n",
+    "APP_VERSIONS = [\"5.12.0\", \"5.12.1\", \"5.13.0\", \"5.14.2\"]\n",
+    "LEGIT_BROWSE = [\"history\", \"rates\", \"profile\", \"notifications\", \"help\", \"recipients\"]\n",
+    "TRANSFER_PATH = [\"send_money\", \"recipient_select\", \"amount_entry\", \"review\", \"confirm\"]\n",
+    "ATO_SCREENS = [\"profile\", \"security_settings\", \"change_phone\", \"recipients\", \"add_recipient\", \"limits\",\n",
+    "               \"send_money\", \"amount_entry\", \"review\", \"confirm\", \"rates\", \"history\"]\n",
+    "\n",
+    "rng = np.random.default_rng(SEED)\n",
+    "\n",
+    "def uid():\n",
+    "    return str(uuid.UUID(bytes=rng.bytes(16), version=4))\n",
+    "\n",
+    "def new_device():\n",
+    "    return \"dev-\" + rng.bytes(6).hex()\n",
+    "\n",
+    "def rand_ip():\n",
+    "    return f\"100.{rng.integers(64, 128)}.{rng.integers(0, 256)}.{rng.integers(1, 255)}\"\n",
+    "\n",
+    "def iso(ts):\n",
+    "    return ts.strftime(\"%Y-%m-%dT%H:%M:%S.%f\")[:-3] + \"Z\"\n",
+    "\n",
+    "def sec(x):\n",
+    "    return timedelta(seconds=float(x))\n",
+    "\n",
+    "def make_customers(n, fraud_rate, seed):\n",
+    "    \"\"\"Deterministic customer universe so backfill and live runs share the same customers.\"\"\"\n",
+    "    r = np.random.default_rng(seed + 1)\n",
+    "    fraud_idx = set(r.choice(n, int(round(n * fraud_rate)), replace=False).tolist())\n",
+    "    today = datetime.now(timezone.utc).date()\n",
+    "    custs = []\n",
+    "    for i in range(n):\n",
+    "        custs.append({\n",
+    "            \"customer_id\": f\"C{i + 1:06d}\",\n",
+    "            \"home_corridor\": str(r.choice(CORRIDORS, p=CORRIDOR_P)),\n",
+    "            \"preferred_payout\": str(r.choice(PAYOUTS, p=PAYOUT_P)),\n",
+    "            \"typical_amount\": float(np.round(np.exp(r.normal(5.5, 0.6)), 2)),  # median ~ $245\n",
+    "            \"devices\": [\"dev-\" + r.bytes(6).hex() for _ in range(int(r.choice([1, 2], p=[0.75, 0.25])))],\n",
+    "            \"home_ip\": f\"100.{r.integers(64, 128)}.{r.integers(0, 256)}.{r.integers(1, 255)}\",\n",
+    "            \"phone\": f\"+1-555-{r.integers(100, 1000)}-{r.integers(1000, 10000)}\",\n",
+    "            \"sessions_per_day\": float(r.gamma(2.0, 0.4)),\n",
+    "            \"transfer_prob\": float(r.uniform(0.15, 0.4)),\n",
+    "            \"signup_date\": str(today - timedelta(days=int(r.integers(60, 1500)))),\n",
+    "            \"is_fraudster\": i in fraud_idx,\n",
+    "        })\n",
+    "    return custs\n",
+    "\n",
+    "customers = make_customers(N_CUSTOMERS, FRAUD_RATE, SEED)\n",
+    "fraudsters = [c for c in customers if c[\"is_fraudster\"]]\n",
+    "print(f\"customers={len(customers)}  fraudster accounts={len(fraudsters)} ({len(fraudsters)/len(customers):.2%})\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794532877322,
+     "inputWidgets": {},
+     "nuid": "91c751d8-e33c-420c-a881-abfa1cd159d6",
+     "showTitle": true,
+     "startTime": 1794532877022,
+     "submitTime": 1794532876940,
+     "tableResultSettingsMap": {},
+     "title": "Session simulators (legit, hard-negative, account takeover)"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "4 29\n"
+     ]
+    }
+   ],
+   "source": [
+    "def _e(stream, ts, c, **kw):\n",
+    "    d = {\"event_id\": uid(), \"customer_id\": c[\"customer_id\"], \"event_ts\": iso(ts)}\n",
+    "    d.update(kw)\n",
+    "    return (stream, ts, d)\n",
+    "\n",
+    "def _transfer(ts, c, amount, corridor, payout, recipient_id, device, ip, is_fraud):\n",
+    "    return (\"transfers\", ts, {\n",
+    "        \"transfer_id\": uid(), \"customer_id\": c[\"customer_id\"], \"amount_usd\": round(float(amount), 2),\n",
+    "        \"currency\": \"USD\", \"corridor\": corridor, \"payout_method\": payout, \"recipient_id\": recipient_id,\n",
+    "        \"device_id\": device, \"ip\": ip, \"ts\": iso(ts), \"is_fraud\": int(is_fraud)})\n",
+    "\n",
+    "def legit_session(c, t, hard=False):\n",
+    "    \"\"\"Normal session. hard=True -> traveling customer (new device, foreign geo, OTP retries, bigger amount).\"\"\"\n",
+    "    out, sid = [], uid()\n",
+    "    if hard or rng.random() < 0.01:\n",
+    "        dev = new_device()\n",
+    "    else:\n",
+    "        dev = c[\"devices\"][0] if rng.random() < 0.85 else str(rng.choice(c[\"devices\"]))\n",
+    "    new_dev = dev not in c[\"devices\"]\n",
+    "    ip = rand_ip() if (hard or rng.random() < 0.15) else c[\"home_ip\"]\n",
+    "    geo = str(rng.choice([\"MX\", \"PH\", \"IN\", \"CA\"])) if hard else \"US\"\n",
+    "    app = str(rng.choice(APP_VERSIONS))\n",
+    "    base = dict(device_id=dev, ip=ip, geo_country=geo, app_version=app, session_id=sid)\n",
+    "    if rng.random() < 0.05:\n",
+    "        out.append(_e(\"login\", t, c, auth_method=\"password\", success=False, failure_reason=\"bad_password\", **base))\n",
+    "        t += sec(rng.uniform(5, 40))\n",
+    "    out.append(_e(\"login\", t, c, auth_method=\"biometric\" if (rng.random() < 0.6 and not new_dev) else \"password\",\n",
+    "                  success=True, failure_reason=None, **base))\n",
+    "    t += sec(rng.uniform(1, 3))\n",
+    "    will_transfer = rng.random() < c[\"transfer_prob\"]\n",
+    "    if new_dev or (will_transfer and rng.random() < 0.4):\n",
+    "        n_fail = int(rng.choice([0, 1, 2], p=[0.5, 0.35, 0.15] if hard else [0.85, 0.12, 0.03]))\n",
+    "        otp = dict(device_id=dev, phone=c[\"phone\"], otp_channel=\"sms\" if new_dev else str(rng.choice([\"sms\", \"push\"])), session_id=sid)\n",
+    "        out.append(_e(\"otp\", t, c, status=\"sent\", attempt_no=1, **otp))\n",
+    "        for k in range(n_fail):\n",
+    "            t += sec(rng.uniform(15, 60))\n",
+    "            out.append(_e(\"otp\", t, c, status=\"failed\", attempt_no=k + 1, **otp))\n",
+    "        t += sec(rng.uniform(10, 45))\n",
+    "        out.append(_e(\"otp\", t, c, status=\"verified\", attempt_no=n_fail + 1, **otp))\n",
+    "    screens = [\"home\"] + list(rng.choice(LEGIT_BROWSE, size=int(rng.integers(1, 5)))) + (TRANSFER_PATH if will_transfer else [])\n",
+    "    for i, s in enumerate(screens):\n",
+    "        dwell = int(np.exp(rng.normal(8.8, 0.6)))  # ~6.6s median\n",
+    "        out.append(_e(\"screen_view\", t, c, device_id=dev, session_id=sid, screen_name=str(s), dwell_ms=dwell, screen_seq=i + 1))\n",
+    "        t += timedelta(milliseconds=dwell)\n",
+    "    if will_transfer:\n",
+    "        corridor = c[\"home_corridor\"] if rng.random() < 0.95 else str(rng.choice(CORRIDORS))\n",
+    "        amt = c[\"typical_amount\"] * np.exp(rng.normal(0, 0.35)) * (rng.uniform(1.5, 3.0) if hard else 1.0)\n",
+    "        payout = c[\"preferred_payout\"] if rng.random() < 0.85 else str(rng.choice(PAYOUTS, p=PAYOUT_P))\n",
+    "        recipient = f\"R{c['customer_id'][1:]}-{int(rng.integers(1, 4))}\"\n",
+    "        out.append(_transfer(t, c, min(amt, 9999), corridor, payout, recipient, dev, ip, 0))\n",
+    "    return out\n",
+    "\n",
+    "def ato_session(c, t):\n",
+    "    \"\"\"Account-takeover session. ~25% partial (weaker signal).\"\"\"\n",
+    "    partial = rng.random() < 0.25\n",
+    "    out, sid, dev, ip = [], uid(), new_device(), rand_ip()\n",
+    "    base = dict(device_id=dev, ip=ip, geo_country=str(rng.choice(FOREIGN_GEOS)), app_version=str(rng.choice(APP_VERSIONS)), session_id=sid)\n",
+    "    for _ in range(int(rng.integers(1, 4)) if not partial else int(rng.integers(0, 2))):\n",
+    "        out.append(_e(\"login\", t, c, auth_method=\"password\", success=False, failure_reason=\"bad_password\", **base))\n",
+    "        t += sec(rng.uniform(3, 15))\n",
+    "    out.append(_e(\"login\", t, c, auth_method=\"password\", success=True, failure_reason=None, **base))\n",
+    "    t += sec(rng.uniform(1, 3))\n",
+    "    otp = dict(device_id=dev, phone=c[\"phone\"], otp_channel=\"sms\", session_id=sid)\n",
+    "    n_fail = int(rng.integers(3, 8)) if not partial else int(rng.integers(0, 2))\n",
+    "    out.append(_e(\"otp\", t, c, status=\"sent\", attempt_no=1, **otp))\n",
+    "    for k in range(n_fail):\n",
+    "        t += sec(rng.uniform(5, 25))\n",
+    "        out.append(_e(\"otp\", t, c, status=\"failed\", attempt_no=k + 1, **otp))\n",
+    "    t += sec(rng.uniform(5, 20))\n",
+    "    out.append(_e(\"otp\", t, c, status=\"verified\", attempt_no=n_fail + 1, **otp))\n",
+    "    n_screens = int(rng.integers(10, 26)) if not partial else int(rng.integers(5, 10))\n",
+    "    for i in range(n_screens):\n",
+    "        dwell = int(np.exp(rng.normal(6.6, 0.5)))  # ~735ms median: rapid hops\n",
+    "        out.append(_e(\"screen_view\", t, c, device_id=dev, session_id=sid, screen_name=str(rng.choice(ATO_SCREENS)), dwell_ms=dwell, screen_seq=i + 1))\n",
+    "        t += timedelta(milliseconds=dwell)\n",
+    "    other = [k for k in CORRIDORS if k != c[\"home_corridor\"]]\n",
+    "    for _ in range(int(rng.choice([1, 2], p=[0.7, 0.3]))):\n",
+    "        amt = float(np.clip(c[\"typical_amount\"] * rng.uniform(4, 15), 800, 9500))\n",
+    "        out.append(_transfer(t, c, amt, str(rng.choice(other)), str(rng.choice([\"cash_pickup\", \"mobile_wallet\"])),\n",
+    "                             \"R\" + rng.bytes(4).hex(), dev, ip, 1))\n",
+    "        t += sec(rng.uniform(30, 120))\n",
+    "    return out\n",
+    "\n",
+    "print(len(legit_session(customers[0], datetime.now(timezone.utc))), len(ato_session(fraudsters[0], datetime.now(timezone.utc))))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794532882201,
+     "inputWidgets": {},
+     "nuid": "5090d523-81a7-4e88-a299-8f955badd1e3",
+     "showTitle": true,
+     "startTime": 1794532881811,
+     "submitTime": 1794532881736,
+     "tableResultSettingsMap": {},
+     "title": "Kinesis envelope and atomic file writer"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "RUN_PREFIX = f\"{int(time.time() * 1e6):016d}\"  # unique per run -> sequence numbers never collide across runs\n",
+    "_seq = {\"n\": 0}\n",
+    "\n",
+    "def next_seq():\n",
+    "    _seq[\"n\"] += 1\n",
+    "    return f\"49{RUN_PREFIX}{_seq['n']:012d}\"\n",
+    "\n",
+    "def corrupt(stream, p):\n",
+    "    p = dict(p)\n",
+    "    choice = rng.integers(0, 3)\n",
+    "    if choice == 0:\n",
+    "        p[\"customer_id\"] = None\n",
+    "    elif choice == 1:\n",
+    "        p[\"ts\" if stream == \"transfers\" else \"event_ts\"] = None\n",
+    "    elif stream == \"transfers\":\n",
+    "        p[\"amount_usd\"] = -abs(p[\"amount_usd\"])\n",
+    "    else:\n",
+    "        p[\"event_ts\"] = \"not-a-timestamp\"\n",
+    "    return p\n",
+    "\n",
+    "def to_record(ts, payload):\n",
+    "    lag = rng.exponential(0.4) if rng.random() > 0.01 else rng.uniform(30, 600)  # 1% late arrivals\n",
+    "    return {\"partitionKey\": payload[\"customer_id\"] or \"unknown\", \"sequenceNumber\": next_seq(),\n",
+    "            \"approximateArrivalTimestamp\": round(ts.timestamp() + lag, 3), \"data\": payload}\n",
+    "\n",
+    "def write_batch(events, tag):\n",
+    "    \"\"\"events: list of (stream, ts, payload). Writes one JSONL file per stream; staged then moved so Auto Loader never sees partial files.\"\"\"\n",
+    "    by_stream = defaultdict(list)\n",
+    "    for stream, ts, p in events:\n",
+    "        if rng.random() < BAD_RATE:\n",
+    "            p = corrupt(stream, p)\n",
+    "        rec = to_record(ts, p)\n",
+    "        by_stream[stream].append(rec)\n",
+    "        if rng.random() < DUP_RATE:\n",
+    "            by_stream[stream].append(dict(rec))\n",
+    "    stats = {}\n",
+    "    for stream, recs in by_stream.items():\n",
+    "        recs.sort(key=lambda r: r[\"approximateArrivalTimestamp\"])\n",
+    "        fname = f\"{tag}_{uuid.uuid4().hex[:8]}.json\"\n",
+    "        tmp = f\"{VOL_ROOT}/_staging/{stream}_{fname}\"\n",
+    "        with open(tmp, \"w\") as f:\n",
+    "            f.write(\"\\n\".join(json.dumps(r, separators=(\",\", \":\")) for r in recs) + \"\\n\")\n",
+    "        shutil.move(tmp, f\"{VOL_ROOT}/{stream}/{fname}\")\n",
+    "        stats[stream] = len(recs)\n",
+    "    return stats"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794532900297,
+     "inputWidgets": {},
+     "nuid": "bda5d38e-a119-4386-9f1c-3307c676f3f9",
+     "showTitle": true,
+     "startTime": 1794532888465,
+     "submitTime": 1794532888403,
+     "tableResultSettingsMap": {},
+     "title": "Customer dimension table (PII lives here and in events)"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>customer_id</th><th>home_corridor</th><th>preferred_payout</th><th>phone</th><th>primary_device_id</th><th>home_ip</th><th>signup_date</th></tr></thead><tbody><tr><td>C000001</td><td>US-MX</td><td>mobile_wallet</td><td>+1-555-759-2965</td><td>dev-22bdadc05073</td><td>100.110.94.52</td><td>2025-04-04</td></tr><tr><td>C000002</td><td>US-MX</td><td>bank_deposit</td><td>+1-555-582-4873</td><td>dev-e15a6450bf87</td><td>100.120.191.193</td><td>2026-07-16</td></tr><tr><td>C000003</td><td>US-IN</td><td>cash_pickup</td><td>+1-555-618-9650</td><td>dev-8293b8ad7251</td><td>100.98.234.238</td><td>2024-10-26</td></tr><tr><td>C000004</td><td>US-MX</td><td>bank_deposit</td><td>+1-555-118-6753</td><td>dev-36857819c458</td><td>100.74.25.125</td><td>2022-11-17</td></tr><tr><td>C000005</td><td>US-NG</td><td>bank_deposit</td><td>+1-555-146-2512</td><td>dev-eefe2b9c649f</td><td>100.103.72.205</td><td>2025-04-16</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "C000001",
+         "US-MX",
+         "mobile_wallet",
+         "+1-555-759-2965",
+         "dev-22bdadc05073",
+         "100.110.94.52",
+         "2025-04-04"
+        ],
+        [
+         "C000002",
+         "US-MX",
+         "bank_deposit",
+         "+1-555-582-4873",
+         "dev-e15a6450bf87",
+         "100.120.191.193",
+         "2026-07-16"
+        ],
+        [
+         "C000003",
+         "US-IN",
+         "cash_pickup",
+         "+1-555-618-9650",
+         "dev-8293b8ad7251",
+         "100.98.234.238",
+         "2024-10-26"
+        ],
+        [
+         "C000004",
+         "US-MX",
+         "bank_deposit",
+         "+1-555-118-6753",
+         "dev-36857819c458",
+         "100.74.25.125",
+         "2022-11-17"
+        ],
+        [
+         "C000005",
+         "US-NG",
+         "bank_deposit",
+         "+1-555-146-2512",
+         "dev-eefe2b9c649f",
+         "100.103.72.205",
+         "2025-04-16"
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "customer_id",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "home_corridor",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "preferred_payout",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "phone",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "primary_device_id",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "home_ip",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "signup_date",
+         "type": "\"date\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "from pyspark.sql import functions as F\n",
+    "\n",
+    "cust_rows = [(c[\"customer_id\"], c[\"home_corridor\"], c[\"preferred_payout\"], c[\"phone\"], c[\"devices\"][0], c[\"home_ip\"], c[\"signup_date\"])\n",
+    "             for c in customers]\n",
+    "cust_df = (spark.createDataFrame(cust_rows, \"customer_id string, home_corridor string, preferred_payout string, phone string, primary_device_id string, home_ip string, signup_date string\")\n",
+    "           .withColumn(\"signup_date\", F.to_date(\"signup_date\")))\n",
+    "# Ground-truth fraudster flag is intentionally NOT written here (label only lives on transfers.is_fraud) to avoid leakage.\n",
+    "cust_df.write.mode(\"overwrite\").option(\"overwriteSchema\", \"true\").saveAsTable(f\"{CATALOG}.{SCHEMA}.customers\")\n",
+    "display(spark.table(f\"{CATALOG}.{SCHEMA}.customers\").limit(5))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794532906772,
+     "inputWidgets": {},
+     "nuid": "ebf7f030-6926-4d46-8df2-df9aabbd1085",
+     "showTitle": true,
+     "startTime": 1794532906273,
+     "submitTime": 1794532906216,
+     "tableResultSettingsMap": {},
+     "title": "One-time 30-day backfill"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Backfill already done, skipping: {\"completed_at\": \"2026-11-13T00:40:25.896Z\", \"days\": 30, \"seed\": 42, \"records\": {\"login\": 125583, \"screen_view\": 582586, \"transfers\": 32982, \"otp\": 34632}, \"incidents\": 197}\n"
+     ]
+    }
+   ],
+   "source": [
+    "MARKER = f\"{VOL_ROOT}/_meta/backfill_done.json\"\n",
+    "HOUR_P = np.array([1, 1, 1, 1, 1, 2, 3, 4, 5, 5, 5, 5, 6, 6, 5, 5, 5, 6, 8, 9, 9, 8, 5, 2], dtype=float)\n",
+    "HOUR_P /= HOUR_P.sum()\n",
+    "\n",
+    "def run_backfill(days):\n",
+    "    now = datetime.now(timezone.utc).replace(microsecond=0)\n",
+    "    start = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0)\n",
+    "    # Pre-schedule 1-3 ATO incidents per fraudster across the window (skewed to recent weeks).\n",
+    "    incidents = defaultdict(list)\n",
+    "    for c in fraudsters:\n",
+    "        for _ in range(int(rng.integers(1, 4))):\n",
+    "            d = int(min(days - 1, rng.triangular(0, days * 0.7, days - 1)))\n",
+    "            incidents[d].append(c)\n",
+    "    totals = defaultdict(int)\n",
+    "    for d in range(days):\n",
+    "        day0 = start + timedelta(days=d)\n",
+    "        evs = []\n",
+    "        for c in customers:\n",
+    "            for _ in range(rng.poisson(c[\"sessions_per_day\"])):\n",
+    "                t = day0 + timedelta(hours=int(rng.choice(24, p=HOUR_P)), seconds=float(rng.uniform(0, 3600)))\n",
+    "                evs += legit_session(c, t, hard=rng.random() < 0.01)\n",
+    "        for c in incidents[d]:\n",
+    "            t = day0 + timedelta(hours=int(rng.integers(0, 24)), seconds=float(rng.uniform(0, 3600)))\n",
+    "            evs += ato_session(c, t)\n",
+    "        evs = [e for e in evs if e[1] <= now]\n",
+    "        for k, v in write_batch(evs, f\"backfill_{day0:%Y%m%d}\").items():\n",
+    "            totals[k] += v\n",
+    "    with open(MARKER, \"w\") as f:\n",
+    "        json.dump({\"completed_at\": iso(datetime.now(timezone.utc)), \"days\": days, \"seed\": SEED, \"records\": totals,\n",
+    "                   \"incidents\": sum(len(v) for v in incidents.values())}, f)\n",
+    "    return dict(totals), sum(len(v) for v in incidents.values())\n",
+    "\n",
+    "if MODE in (\"backfill\", \"backfill_and_live\"):\n",
+    "    if os.path.exists(MARKER) and not FORCE_BACKFILL:\n",
+    "        print(\"Backfill already done, skipping:\", open(MARKER).read())\n",
+    "    else:\n",
+    "        t0 = time.time()\n",
+    "        totals, n_inc = run_backfill(BACKFILL_DAYS)\n",
+    "        print(f\"Backfill wrote {totals} records, {n_inc} ATO incidents in {time.time() - t0:.0f}s\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794532972016,
+     "inputWidgets": {},
+     "nuid": "db42b926-ef12-4b8d-afc7-6004d0b4be6a",
+     "showTitle": true,
+     "startTime": 1794532911864,
+     "submitTime": 1794532911774,
+     "tableResultSettingsMap": {},
+     "title": "Live micro-batch loop"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Live mode: 12 micro-batches, records={'login': 548, 'screen_view': 2563, 'transfers': 147, 'otp': 197}\n"
+     ]
+    }
+   ],
+   "source": [
+    "def live_tick(now):\n",
+    "    weights = np.array([c[\"sessions_per_day\"] for c in customers]); weights /= weights.sum()\n",
+    "    evs = []\n",
+    "    picks = rng.choice(len(customers), size=rng.poisson(LIVE_SESSIONS_PER_TICK), p=weights)\n",
+    "    sessions = [legit_session(customers[i], now, hard=rng.random() < 0.01) for i in picks]\n",
+    "    if rng.random() < 0.3:  # keep fraud visible in the live demo\n",
+    "        sessions.append(ato_session(fraudsters[int(rng.integers(len(fraudsters)))], now))\n",
+    "    for s in sessions:\n",
+    "        # shift each session so it ends \"now\" (no future timestamps)\n",
+    "        shift = s[-1][1] - now + timedelta(seconds=float(rng.uniform(0, LIVE_INTERVAL_S)))\n",
+    "        evs += [(st, ts - shift, {**p, **({\"ts\": iso(ts - shift)} if st == \"transfers\" else {\"event_ts\": iso(ts - shift)})}) for st, ts, p in s]\n",
+    "    return evs\n",
+    "\n",
+    "if MODE in (\"live\", \"backfill_and_live\"):\n",
+    "    end, ticks, totals = time.time() + LIVE_DURATION_S, 0, defaultdict(int)\n",
+    "    while time.time() < end:\n",
+    "        t_start = time.time()\n",
+    "        stats = write_batch(live_tick(datetime.now(timezone.utc)), f\"live_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}\")\n",
+    "        for k, v in stats.items():\n",
+    "            totals[k] += v\n",
+    "        ticks += 1\n",
+    "        time.sleep(max(0, LIVE_INTERVAL_S - (time.time() - t_start)))\n",
+    "    print(f\"Live mode: {ticks} micro-batches, records={dict(totals)}\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794532986079,
+     "inputWidgets": {},
+     "nuid": "5a1c5c71-14ab-4032-944c-c0b3bcd8c9e9",
+     "showTitle": true,
+     "startTime": 1794532975614,
+     "submitTime": 1794532975545,
+     "tableResultSettingsMap": {},
+     "title": "Validate landed files"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>stream</th><th>records</th><th>distinct_seq</th><th>customers</th><th>null_customer</th><th>files</th></tr></thead><tbody><tr><td>login</td><td>126617</td><td>125978</td><td>4971</td><td>74</td><td>54</td></tr><tr><td>otp</td><td>34973</td><td>34811</td><td>4166</td><td>29</td><td>54</td></tr><tr><td>screen_view</td><td>587483</td><td>584608</td><td>4971</td><td>381</td><td>54</td></tr><tr><td>transfers</td><td>33260</td><td>33100</td><td>4672</td><td>27</td><td>54</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "login",
+         126617,
+         125978,
+         4971,
+         74,
+         54
+        ],
+        [
+         "otp",
+         34973,
+         34811,
+         4166,
+         29,
+         54
+        ],
+        [
+         "screen_view",
+         587483,
+         584608,
+         4971,
+         381,
+         54
+        ],
+        [
+         "transfers",
+         33260,
+         33100,
+         4672,
+         27,
+         54
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "stream",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "records",
+         "type": "\"long\""
+        },
+        {
+         "metadata": "{}",
+         "name": "distinct_seq",
+         "type": "\"long\""
+        },
+        {
+         "metadata": "{}",
+         "name": "customers",
+         "type": "\"long\""
+        },
+        {
+         "metadata": "{}",
+         "name": "null_customer",
+         "type": "\"long\""
+        },
+        {
+         "metadata": "{}",
+         "name": "files",
+         "type": "\"long\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    },
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>is_fraud</th><th>transfers</th><th>customers</th><th>avg_amount</th><th>pct_cash_or_wallet</th><th>share</th></tr></thead><tbody><tr><td>0</td><td>32841</td><td>4666</td><td>314.01</td><td>0.401</td><td>0.9923</td></tr><tr><td>1</td><td>256</td><td>100</td><td>2747.78</td><td>1.0</td><td>0.0077</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         0,
+         32841,
+         4666,
+         314.01,
+         0.401,
+         0.9923
+        ],
+        [
+         1,
+         256,
+         100,
+         2747.78,
+         1.0,
+         0.0077
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "is_fraud",
+         "type": "\"long\""
+        },
+        {
+         "metadata": "{}",
+         "name": "transfers",
+         "type": "\"long\""
+        },
+        {
+         "metadata": "{}",
+         "name": "customers",
+         "type": "\"long\""
+        },
+        {
+         "metadata": "{}",
+         "name": "avg_amount",
+         "type": "\"double\""
+        },
+        {
+         "metadata": "{}",
+         "name": "pct_cash_or_wallet",
+         "type": "\"double\""
+        },
+        {
+         "metadata": "{}",
+         "name": "share",
+         "type": "\"double\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    },
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>approximateArrivalTimestamp</th><th>data</th><th>partitionKey</th><th>sequenceNumber</th></tr></thead><tbody><tr><td>1.792627369209E9</td><td>List(1, C004928, dev-7c1584dccc32, b89cc970-01bd-478e-b175-8c82ff67ffe8, 2026-10-22T00:02:48.562Z, sms, +1-555-478-1886, c60ea370-0575-4412-811b-d14951274ee3, sent)</td><td>C004928</td><td>491794530289478129000000232466</td></tr><tr><td>1.792627375245E9</td><td>List(1, C004928, dev-7c1584dccc32, 44dfcd52-d6bc-44bb-8869-8991f19e2f81, 2026-10-22T00:02:54.073Z, sms, +1-555-478-1886, c60ea370-0575-4412-811b-d14951274ee3, failed)</td><td>C004928</td><td>491794530289478129000000232467</td></tr><tr><td>1.79262739795E9</td><td>List(2, C004928, dev-7c1584dccc32, 5998da84-a4ff-41d3-a11f-791fd006beb4, 2026-10-22T00:03:17.742Z, sms, +1-555-478-1886, c60ea370-0575-4412-811b-d14951274ee3, failed)</td><td>C004928</td><td>491794530289478129000000232468</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         1.792627369209E9,
+         [
+          1,
+          "C004928",
+          "dev-7c1584dccc32",
+          "b89cc970-01bd-478e-b175-8c82ff67ffe8",
+          "2026-10-22T00:02:48.562Z",
+          "sms",
+          "+1-555-478-1886",
+          "c60ea370-0575-4412-811b-d14951274ee3",
+          "sent"
+         ],
+         "C004928",
+         "491794530289478129000000232466"
+        ],
+        [
+         1.792627375245E9,
+         [
+          1,
+          "C004928",
+          "dev-7c1584dccc32",
+          "44dfcd52-d6bc-44bb-8869-8991f19e2f81",
+          "2026-10-22T00:02:54.073Z",
+          "sms",
+          "+1-555-478-1886",
+          "c60ea370-0575-4412-811b-d14951274ee3",
+          "failed"
+         ],
+         "C004928",
+         "491794530289478129000000232467"
+        ],
+        [
+         1.79262739795E9,
+         [
+          2,
+          "C004928",
+          "dev-7c1584dccc32",
+          "5998da84-a4ff-41d3-a11f-791fd006beb4",
+          "2026-10-22T00:03:17.742Z",
+          "sms",
+          "+1-555-478-1886",
+          "c60ea370-0575-4412-811b-d14951274ee3",
+          "failed"
+         ],
+         "C004928",
+         "491794530289478129000000232468"
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "approximateArrivalTimestamp",
+         "type": "\"double\""
+        },
+        {
+         "metadata": "{}",
+         "name": "data",
+         "type": "{\"fields\":[{\"metadata\":{},\"name\":\"attempt_no\",\"nullable\":true,\"type\":\"long\"},{\"metadata\":{},\"name\":\"customer_id\",\"nullable\":true,\"type\":\"string\"},{\"metadata\":{},\"name\":\"device_id\",\"nullable\":true,\"type\":\"string\"},{\"metadata\":{},\"name\":\"event_id\",\"nullable\":true,\"type\":\"string\"},{\"metadata\":{},\"name\":\"event_ts\",\"nullable\":true,\"type\":\"string\"},{\"metadata\":{},\"name\":\"otp_channel\",\"nullable\":true,\"type\":\"string\"},{\"metadata\":{},\"name\":\"phone\",\"nullable\":true,\"type\":\"string\"},{\"metadata\":{},\"name\":\"session_id\",\"nullable\":true,\"type\":\"string\"},{\"metadata\":{},\"name\":\"status\",\"nullable\":true,\"type\":\"string\"}],\"type\":\"struct\"}"
+        },
+        {
+         "metadata": "{}",
+         "name": "partitionKey",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "sequenceNumber",
+         "type": "\"string\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "summary = []\n",
+    "for s in STREAMS:\n",
+    "    df = spark.read.json(f\"{VOL_ROOT}/{s}\").select(\"*\", F.col(\"_metadata.file_path\").alias(\"_file\"))\n",
+    "    summary.append(df.agg(F.lit(s).alias(\"stream\"), F.count(\"*\").alias(\"records\"),\n",
+    "                          F.countDistinct(\"sequenceNumber\").alias(\"distinct_seq\"),\n",
+    "                          F.countDistinct(\"data.customer_id\").alias(\"customers\"),\n",
+    "                          F.sum(F.col(\"data.customer_id\").isNull().cast(\"int\")).alias(\"null_customer\"),\n",
+    "                          F.countDistinct(\"_file\").alias(\"files\")))\n",
+    "from functools import reduce\n",
+    "display(reduce(lambda a, b: a.unionByName(b), summary))\n",
+    "\n",
+    "tr = spark.read.json(f\"{VOL_ROOT}/transfers\").select(\"data.*\").dropDuplicates([\"transfer_id\"])\n",
+    "display(tr.groupBy(\"is_fraud\").agg(F.count(\"*\").alias(\"transfers\"), F.countDistinct(\"customer_id\").alias(\"customers\"),\n",
+    "                                    F.round(F.avg(\"amount_usd\"), 2).alias(\"avg_amount\"),\n",
+    "                                    F.round(F.avg((F.col(\"payout_method\").isin(\"cash_pickup\", \"mobile_wallet\")).cast(\"int\")), 3).alias(\"pct_cash_or_wallet\"))\n",
+    "          .withColumn(\"share\", F.round(F.col(\"transfers\") / F.lit(tr.count()), 4)))\n",
+    "display(spark.read.json(f\"{VOL_ROOT}/otp\").limit(3))"
+   ]
+  }
+ ],
+ "metadata": {
+  "application/vnd.databricks.v1+notebook": {
+   "computePreferences": null,
+   "dashboards": [],
+   "environmentMetadata": {
+    "base_environment": "",
+    "environment_version": "6"
+   },
+   "inputWidgetPreferences": null,
+   "language": "python",
+   "notebookMetadata": {
+    "pythonIndentUnit": 4
+   },
+   "notebookName": "01_generate_events",
+   "widgets": {
+    "backfill_days": {
+     "currentValue": "30",
+     "nuid": "a008c50c-484d-4d6c-8dd2-85b347056ae0",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "30",
+      "label": null,
+      "name": "backfill_days",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "30",
+      "label": null,
+      "name": "backfill_days",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "catalog": {
+     "currentValue": "mlo_serverless_stable_catalog",
+     "nuid": "4d5392a1-5e83-4ee5-a2f3-c0596fac6bee",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "mlo_serverless_stable_catalog",
+      "label": null,
+      "name": "catalog",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "mlo_serverless_stable_catalog",
+      "label": null,
+      "name": "catalog",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "force_backfill": {
+     "currentValue": "false",
+     "nuid": "48f7102c-ed9b-499c-94c8-20f76585fefd",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "false",
+      "label": null,
+      "name": "force_backfill",
+      "options": {
+       "widgetDisplayType": "Dropdown",
+       "choices": [
+        "true",
+        "false"
+       ],
+       "fixedDomain": true,
+       "multiselect": false
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "dropdown",
+      "defaultValue": "false",
+      "label": null,
+      "name": "force_backfill",
+      "options": {
+       "widgetType": "dropdown",
+       "autoCreated": false,
+       "choices": [
+        "true",
+        "false"
+       ]
+      }
+     }
+    },
+    "fraud_rate": {
+     "currentValue": "0.02",
+     "nuid": "f8f208c1-af71-4fa9-adf8-9223b9161d7f",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "0.02",
+      "label": null,
+      "name": "fraud_rate",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "0.02",
+      "label": null,
+      "name": "fraud_rate",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "live_duration_seconds": {
+     "currentValue": "60",
+     "nuid": "5b231391-58a1-40d1-a0d4-5804881526d0",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "60",
+      "label": null,
+      "name": "live_duration_seconds",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "60",
+      "label": null,
+      "name": "live_duration_seconds",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "live_interval_seconds": {
+     "currentValue": "5",
+     "nuid": "81cb72ba-f691-4373-954b-8495d7fc7222",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "5",
+      "label": null,
+      "name": "live_interval_seconds",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "5",
+      "label": null,
+      "name": "live_interval_seconds",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "live_sessions_per_tick": {
+     "currentValue": "40",
+     "nuid": "5f21a198-dfaf-4eda-8f8e-f2a7cca4820d",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "40",
+      "label": null,
+      "name": "live_sessions_per_tick",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "40",
+      "label": null,
+      "name": "live_sessions_per_tick",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "mode": {
+     "currentValue": "backfill_and_live",
+     "nuid": "dc598d31-624c-4b55-959c-f9c3932428a5",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "backfill_and_live",
+      "label": null,
+      "name": "mode",
+      "options": {
+       "widgetDisplayType": "Dropdown",
+       "choices": [
+        "backfill",
+        "live",
+        "backfill_and_live"
+       ],
+       "fixedDomain": true,
+       "multiselect": false
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "dropdown",
+      "defaultValue": "backfill_and_live",
+      "label": null,
+      "name": "mode",
+      "options": {
+       "widgetType": "dropdown",
+       "autoCreated": false,
+       "choices": [
+        "backfill",
+        "live",
+        "backfill_and_live"
+       ]
+      }
+     }
+    },
+    "n_customers": {
+     "currentValue": "5000",
+     "nuid": "5e7b9c33-7a3c-47f6-8dca-929e3d19a34d",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "5000",
+      "label": null,
+      "name": "n_customers",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "5000",
+      "label": null,
+      "name": "n_customers",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "schema": {
+     "currentValue": "fraud_rt",
+     "nuid": "6594d36a-1a37-4d49-8100-6da7a40f930d",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "fraud_rt",
+      "label": null,
+      "name": "schema",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "fraud_rt",
+      "label": null,
+      "name": "schema",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "seed": {
+     "currentValue": "42",
+     "nuid": "6b08ef89-a08e-4530-b0dc-baddfb70f604",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "42",
+      "label": null,
+      "name": "seed",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "42",
+      "label": null,
+      "name": "seed",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "volume": {
+     "currentValue": "raw_events",
+     "nuid": "aeba8d7b-1843-4226-8f31-169e2f02bcc8",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "raw_events",
+      "label": null,
+      "name": "volume",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "raw_events",
+      "label": null,
+      "name": "volume",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    }
+   }
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}

@@ -114,7 +114,7 @@ Counts are as of the 30-day backfill plus 24 live micro-batches per stream (two 
 
 ## Git
 
-This repo is the Databricks Git folder `/Workspace/Users/mike.lo@databricks.com/rt-fraud-fs`, linked to `https://github.com/mik3lol/rt-fraud-fs` (branch `main`). Notebooks are `.ipynb` and are committed with outputs as run evidence. That requires the workspace admin setting "Allow repos to export IPYNB output" and the `.databricks/commit_outputs` config.
+This repo is the Databricks Git folder `/Workspace/Users/mike.lo@databricks.com/rt-fraud-fs`, linked to `https://github.com/mik3lol/rt-fraud-fs` (branch `main`). Notebooks are `.ipynb`. The admin setting "Allow repos to export IPYNB output" is on and `.databricks/commit_outputs` matches `notebooks/**`, but the Git folder still committed the notebooks without outputs. **Run evidence therefore lives in `run_evidence/`**: Jupyter exports with outputs, saved as `*.ipynb.json` so Databricks keeps them as plain files and does not strip the outputs. To view one as a notebook, rename it to `.ipynb` locally or open it in any Jupyter viewer.
 
 ## Next phases
 

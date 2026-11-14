@@ -1,0 +1,1119 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "0beffc5a-abb9-43dd-995f-d0747ec058fe",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Overview"
+    }
+   },
+   "source": [
+    "# 03 - Unity Catalog governance\n",
+    "\n",
+    "* **Column masks** on PII (`device_id`, `ip`, `phone`): members of the privileged group (`pii_admin_group`, default `admins`) see clear values; everyone else sees masked values.\n",
+    "  * `device_id` is masked to a **deterministic token** (`dev-` + sha256 prefix) so non-admin consumers (analysts, feature jobs running as a non-admin principal) can still count distinct devices / join on device without seeing the raw identifier.\n",
+    "  * `ip` keeps the first two octets; `phone` keeps the last 4 digits.\n",
+    "* Masks on pipeline-managed silver tables are declared **in the pipeline schema** (`MASK` clause) because SDP owns those tables; masks on the regular `customers` table are applied here with `ALTER TABLE`.\n",
+    "* Bronze keeps the raw payload (`data` struct) for replay/debugging and is treated as an **engineering-only** layer: no grants to analyst groups.\n",
+    "* Table comments + tags (`domain`, `layer`, `contains_pii`, `data_origin=synthetic`) and column tags (`pii=...`).\n",
+    "\n",
+    "Run order: cells 2-3 before the pipeline update (functions must exist), the rest after."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794615668901,
+     "inputWidgets": {},
+     "nuid": "05fdbd79-0019-401d-a962-52f859168983",
+     "showTitle": true,
+     "startTime": 1794615668699,
+     "submitTime": 1794615668651,
+     "tableResultSettingsMap": {},
+     "title": "Parameters"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "`mlo_serverless_stable_catalog`.`fraud_rt` admins 'fraud_rt_pii_type' = 'phone', 'class.phone_number' = ''\n"
+     ]
+    }
+   ],
+   "source": [
+    "import re\n",
+    "\n",
+    "dbutils.widgets.text(\"catalog\", \"mlo_serverless_stable_catalog\")\n",
+    "dbutils.widgets.text(\"schema\", \"fraud_rt\")\n",
+    "dbutils.widgets.text(\"pii_admin_group\", \"admins\")\n",
+    "\n",
+    "CATALOG = dbutils.widgets.get(\"catalog\")\n",
+    "SCHEMA = dbutils.widgets.get(\"schema\")\n",
+    "PII_GROUP = dbutils.widgets.get(\"pii_admin_group\")\n",
+    "for v in (CATALOG, SCHEMA, PII_GROUP):  # these values are interpolated into DDL -> allow identifiers only\n",
+    "    assert re.fullmatch(r\"[A-Za-z0-9_\\-]+\", v), f\"invalid identifier: {v}\"\n",
+    "FQ = f\"`{CATALOG}`.`{SCHEMA}`\"\n",
+    "\n",
+    "# This shared workspace has ~1000 account-level governed tag policies (e.g. 'pii', 'pii_type', 'domain'-like keys with\n",
+    "# restricted values). To avoid collisions, custom tags use a project prefix and PII columns also get the built-in\n",
+    "# data-classification keys (class.phone_number / class.ip_address) so they line up with UC data classification / ABAC.\n",
+    "P = \"fraud_rt_\"\n",
+    "COLUMN_CLASS_TAG = {\"phone\": \"class.phone_number\", \"ip\": \"class.ip_address\", \"home_ip\": \"class.ip_address\"}\n",
+    "\n",
+    "def pii_column_tags(col):\n",
+    "    kind = {\"home_ip\": \"ip\", \"primary_device_id\": \"device_id\"}.get(col, col)\n",
+    "    tags = [f\"'{P}pii_type' = '{kind}'\"]\n",
+    "    if col in COLUMN_CLASS_TAG:\n",
+    "        tags.append(f\"'{COLUMN_CLASS_TAG[col]}' = ''\")  # key-only governed tag\n",
+    "    return \", \".join(tags)\n",
+    "\n",
+    "print(FQ, PII_GROUP, pii_column_tags(\"phone\"))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794614743107,
+     "inputWidgets": {},
+     "nuid": "e2815802-887b-4b79-ad8b-ed76eaafb4a0",
+     "showTitle": true,
+     "startTime": 1794614731375,
+     "submitTime": 1794614731289,
+     "tableResultSettingsMap": {},
+     "title": "Create PII mask functions"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>routine_name</th><th>comment</th></tr></thead><tbody><tr><td>mask_device_id</td><td>Masks device_id for non-privileged users with a deterministic token (joinable, countable, not reversible). Privileged group: admins.</td></tr><tr><td>mask_ip</td><td>Masks IPv4 for non-privileged users: keeps first two octets. Privileged group: admins.</td></tr><tr><td>mask_phone</td><td>Masks phone numbers for non-privileged users: keeps last 4 digits. Privileged group: admins.</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "mask_device_id",
+         "Masks device_id for non-privileged users with a deterministic token (joinable, countable, not reversible). Privileged group: admins."
+        ],
+        [
+         "mask_ip",
+         "Masks IPv4 for non-privileged users: keeps first two octets. Privileged group: admins."
+        ],
+        [
+         "mask_phone",
+         "Masks phone numbers for non-privileged users: keeps last 4 digits. Privileged group: admins."
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{\"comment\": \"Name of the routine.\"}",
+         "name": "routine_name",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{\"comment\": \"An optional comment describing the routine.\"}",
+         "name": "comment",
+         "type": "\"string\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "PRIV = f\"(is_member('{PII_GROUP}') OR is_account_group_member('{PII_GROUP}'))\"\n",
+    "\n",
+    "masks = {\n",
+    "    \"mask_device_id\": (\"Masks device_id for non-privileged users with a deterministic token (joinable, countable, not reversible).\",\n",
+    "                       \"concat('dev-', substr(sha2(v, 256), 1, 12))\"),\n",
+    "    \"mask_ip\": (\"Masks IPv4 for non-privileged users: keeps first two octets.\",\n",
+    "                \"concat(substring_index(v, '.', 2), '.***.***')\"),\n",
+    "    \"mask_phone\": (\"Masks phone numbers for non-privileged users: keeps last 4 digits.\",\n",
+    "                   \"concat('***-***-', right(v, 4))\"),\n",
+    "}\n",
+    "for fn, (comment, masked_expr) in masks.items():\n",
+    "    spark.sql(f\"\"\"\n",
+    "        CREATE OR REPLACE FUNCTION {FQ}.{fn}(v STRING)\n",
+    "        RETURNS STRING\n",
+    "        COMMENT '{comment} Privileged group: {PII_GROUP}.'\n",
+    "        RETURN CASE WHEN v IS NULL THEN NULL WHEN {PRIV} THEN v ELSE {masked_expr} END\n",
+    "    \"\"\")\n",
+    "display(spark.sql(f\"SELECT routine_name, comment FROM `{CATALOG}`.information_schema.routines WHERE routine_schema = '{SCHEMA}' ORDER BY 1\"))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794614762826,
+     "inputWidgets": {},
+     "nuid": "17944c98-74ab-492d-921e-cc74642821e8",
+     "showTitle": true,
+     "startTime": 1794614747302,
+     "submitTime": 1794614747249,
+     "tableResultSettingsMap": {},
+     "title": "Mask, comment and tag the customers dimension"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "customers governed\n"
+     ]
+    }
+   ],
+   "source": [
+    "T = f\"{FQ}.customers\"\n",
+    "spark.sql(f\"COMMENT ON TABLE {T} IS 'Synthetic customer dimension for the remittance fraud prototype (5K customers). Contains masked PII (phone, primary_device_id, home_ip). No fraud label by design.'\")\n",
+    "col_comments = {\n",
+    "    \"customer_id\": \"Synthetic customer key (C000001..). Join key to all event tables.\",\n",
+    "    \"home_corridor\": \"Corridor the customer usually sends to, e.g. US-MX.\",\n",
+    "    \"preferred_payout\": \"Usual payout method: bank_deposit, cash_pickup, mobile_wallet, home_delivery.\",\n",
+    "    \"phone\": \"PII. Fictional +1-555 phone number. Masked for non-privileged users.\",\n",
+    "    \"primary_device_id\": \"PII. Primary device identifier of the customer. Masked (deterministic token) for non-privileged users.\",\n",
+    "    \"home_ip\": \"PII. Usual IP of the customer (CGNAT range, synthetic). Masked for non-privileged users.\",\n",
+    "    \"signup_date\": \"Account signup date.\",\n",
+    "}\n",
+    "for c, txt in col_comments.items():\n",
+    "    spark.sql(f\"ALTER TABLE {T} ALTER COLUMN {c} COMMENT '{txt}'\")\n",
+    "for c, fn in {\"phone\": \"mask_phone\", \"primary_device_id\": \"mask_device_id\", \"home_ip\": \"mask_ip\"}.items():\n",
+    "    spark.sql(f\"ALTER TABLE {T} ALTER COLUMN {c} SET MASK {FQ}.{fn}\")\n",
+    "    spark.sql(f\"ALTER TABLE {T} ALTER COLUMN {c} SET TAGS ({pii_column_tags(c)})\")\n",
+    "spark.sql(f\"ALTER TABLE {T} SET TAGS ('{P}domain' = 'fraud', '{P}layer' = 'dimension', '{P}contains_pii' = 'true', '{P}data_origin' = 'synthetic')\")\n",
+    "# cleanup: an earlier attempt set the governed 'pii_type' key on phone before switching to the prefixed key\n",
+    "spark.sql(f\"ALTER TABLE {T} ALTER COLUMN phone UNSET TAGS ('pii_type')\")\n",
+    "print(\"customers governed\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794614776675,
+     "inputWidgets": {},
+     "nuid": "38b62b42-7824-4381-98c4-e8703e53be19",
+     "showTitle": true,
+     "startTime": 1794614767117,
+     "submitTime": 1794614767057,
+     "tableResultSettingsMap": {},
+     "title": "Tag bronze and silver pipeline tables"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "pipeline tables tagged\n"
+     ]
+    }
+   ],
+   "source": [
+    "PII_COLS = {\"login\": [\"device_id\", \"ip\"], \"otp\": [\"device_id\", \"phone\"], \"screen_view\": [\"device_id\"], \"transfers\": [\"device_id\", \"ip\"]}\n",
+    "for s, cols in PII_COLS.items():\n",
+    "    spark.sql(f\"ALTER TABLE {FQ}.bronze_{s} SET TAGS ('{P}domain' = 'fraud', '{P}layer' = 'bronze', '{P}contains_pii' = 'true', '{P}access' = 'engineering_only', '{P}data_origin' = 'synthetic', '{P}source' = 'kinesis_shaped_json')\")\n",
+    "    spark.sql(f\"ALTER TABLE {FQ}.silver_{s} SET TAGS ('{P}domain' = 'fraud', '{P}layer' = 'silver', '{P}contains_pii' = 'true', '{P}data_origin' = 'synthetic', '{P}cdf' = 'enabled')\")\n",
+    "    for c in cols:\n",
+    "        spark.sql(f\"ALTER TABLE {FQ}.silver_{s} ALTER COLUMN {c} SET TAGS ({pii_column_tags(c)})\")\n",
+    "spark.sql(f\"ALTER TABLE {FQ}.silver_transfers ALTER COLUMN is_fraud SET TAGS ('{P}ml_role' = 'label')\")\n",
+    "print(\"pipeline tables tagged\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794615443004,
+     "inputWidgets": {},
+     "nuid": "eebab1b4-e935-441f-adb8-3fcccf269486",
+     "showTitle": true,
+     "startTime": 1794615437544,
+     "submitTime": 1794615437500,
+     "tableResultSettingsMap": {},
+     "title": "Verify masks, tags and comments"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>table_name</th><th>column_name</th><th>mask_name</th></tr></thead><tbody><tr><td>customers</td><td>home_ip</td><td>mlo_serverless_stable_catalog.fraud_rt.mask_ip</td></tr><tr><td>customers</td><td>phone</td><td>mlo_serverless_stable_catalog.fraud_rt.mask_phone</td></tr><tr><td>customers</td><td>primary_device_id</td><td>mlo_serverless_stable_catalog.fraud_rt.mask_device_id</td></tr><tr><td>silver_login</td><td>device_id</td><td>mlo_serverless_stable_catalog.fraud_rt.mask_device_id</td></tr><tr><td>silver_login</td><td>ip</td><td>mlo_serverless_stable_catalog.fraud_rt.mask_ip</td></tr><tr><td>silver_otp</td><td>device_id</td><td>mlo_serverless_stable_catalog.fraud_rt.mask_device_id</td></tr><tr><td>silver_otp</td><td>phone</td><td>mlo_serverless_stable_catalog.fraud_rt.mask_phone</td></tr><tr><td>silver_screen_view</td><td>device_id</td><td>mlo_serverless_stable_catalog.fraud_rt.mask_device_id</td></tr><tr><td>silver_transfers</td><td>device_id</td><td>mlo_serverless_stable_catalog.fraud_rt.mask_device_id</td></tr><tr><td>silver_transfers</td><td>ip</td><td>mlo_serverless_stable_catalog.fraud_rt.mask_ip</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "customers",
+         "home_ip",
+         "mlo_serverless_stable_catalog.fraud_rt.mask_ip"
+        ],
+        [
+         "customers",
+         "phone",
+         "mlo_serverless_stable_catalog.fraud_rt.mask_phone"
+        ],
+        [
+         "customers",
+         "primary_device_id",
+         "mlo_serverless_stable_catalog.fraud_rt.mask_device_id"
+        ],
+        [
+         "silver_login",
+         "device_id",
+         "mlo_serverless_stable_catalog.fraud_rt.mask_device_id"
+        ],
+        [
+         "silver_login",
+         "ip",
+         "mlo_serverless_stable_catalog.fraud_rt.mask_ip"
+        ],
+        [
+         "silver_otp",
+         "device_id",
+         "mlo_serverless_stable_catalog.fraud_rt.mask_device_id"
+        ],
+        [
+         "silver_otp",
+         "phone",
+         "mlo_serverless_stable_catalog.fraud_rt.mask_phone"
+        ],
+        [
+         "silver_screen_view",
+         "device_id",
+         "mlo_serverless_stable_catalog.fraud_rt.mask_device_id"
+        ],
+        [
+         "silver_transfers",
+         "device_id",
+         "mlo_serverless_stable_catalog.fraud_rt.mask_device_id"
+        ],
+        [
+         "silver_transfers",
+         "ip",
+         "mlo_serverless_stable_catalog.fraud_rt.mask_ip"
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "table_name",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "column_name",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "mask_name",
+         "type": "\"string\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    },
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>table_name</th><th>tags</th></tr></thead><tbody><tr><td>bronze_login</td><td>fraud_rt_domain=fraud, fraud_rt_data_origin=synthetic, fraud_rt_source=kinesis_shaped_json, fraud_rt_layer=bronze, fraud_rt_contains_pii=true, fraud_rt_access=engineering_only</td></tr><tr><td>bronze_otp</td><td>fraud_rt_source=kinesis_shaped_json, fraud_rt_layer=bronze, fraud_rt_contains_pii=true, fraud_rt_domain=fraud, fraud_rt_data_origin=synthetic, fraud_rt_access=engineering_only</td></tr><tr><td>bronze_screen_view</td><td>fraud_rt_source=kinesis_shaped_json, fraud_rt_contains_pii=true, fraud_rt_domain=fraud, fraud_rt_access=engineering_only, fraud_rt_data_origin=synthetic, fraud_rt_layer=bronze</td></tr><tr><td>bronze_transfers</td><td>fraud_rt_domain=fraud, fraud_rt_contains_pii=true, fraud_rt_source=kinesis_shaped_json, fraud_rt_layer=bronze, fraud_rt_data_origin=synthetic, fraud_rt_access=engineering_only</td></tr><tr><td>customers</td><td>fraud_rt_layer=dimension, fraud_rt_data_origin=synthetic, fraud_rt_domain=fraud, fraud_rt_contains_pii=true</td></tr><tr><td>silver_login</td><td>fraud_rt_data_origin=synthetic, fraud_rt_contains_pii=true, fraud_rt_layer=silver, fraud_rt_domain=fraud, fraud_rt_cdf=enabled</td></tr><tr><td>silver_otp</td><td>fraud_rt_cdf=enabled, fraud_rt_data_origin=synthetic, fraud_rt_contains_pii=true, fraud_rt_layer=silver, fraud_rt_domain=fraud</td></tr><tr><td>silver_screen_view</td><td>fraud_rt_domain=fraud, fraud_rt_contains_pii=true, fraud_rt_layer=silver, fraud_rt_data_origin=synthetic, fraud_rt_cdf=enabled</td></tr><tr><td>silver_transfers</td><td>fraud_rt_layer=silver, fraud_rt_domain=fraud, fraud_rt_contains_pii=true, fraud_rt_cdf=enabled, fraud_rt_data_origin=synthetic</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "bronze_login",
+         "fraud_rt_domain=fraud, fraud_rt_data_origin=synthetic, fraud_rt_source=kinesis_shaped_json, fraud_rt_layer=bronze, fraud_rt_contains_pii=true, fraud_rt_access=engineering_only"
+        ],
+        [
+         "bronze_otp",
+         "fraud_rt_source=kinesis_shaped_json, fraud_rt_layer=bronze, fraud_rt_contains_pii=true, fraud_rt_domain=fraud, fraud_rt_data_origin=synthetic, fraud_rt_access=engineering_only"
+        ],
+        [
+         "bronze_screen_view",
+         "fraud_rt_source=kinesis_shaped_json, fraud_rt_contains_pii=true, fraud_rt_domain=fraud, fraud_rt_access=engineering_only, fraud_rt_data_origin=synthetic, fraud_rt_layer=bronze"
+        ],
+        [
+         "bronze_transfers",
+         "fraud_rt_domain=fraud, fraud_rt_contains_pii=true, fraud_rt_source=kinesis_shaped_json, fraud_rt_layer=bronze, fraud_rt_data_origin=synthetic, fraud_rt_access=engineering_only"
+        ],
+        [
+         "customers",
+         "fraud_rt_layer=dimension, fraud_rt_data_origin=synthetic, fraud_rt_domain=fraud, fraud_rt_contains_pii=true"
+        ],
+        [
+         "silver_login",
+         "fraud_rt_data_origin=synthetic, fraud_rt_contains_pii=true, fraud_rt_layer=silver, fraud_rt_domain=fraud, fraud_rt_cdf=enabled"
+        ],
+        [
+         "silver_otp",
+         "fraud_rt_cdf=enabled, fraud_rt_data_origin=synthetic, fraud_rt_contains_pii=true, fraud_rt_layer=silver, fraud_rt_domain=fraud"
+        ],
+        [
+         "silver_screen_view",
+         "fraud_rt_domain=fraud, fraud_rt_contains_pii=true, fraud_rt_layer=silver, fraud_rt_data_origin=synthetic, fraud_rt_cdf=enabled"
+        ],
+        [
+         "silver_transfers",
+         "fraud_rt_layer=silver, fraud_rt_domain=fraud, fraud_rt_contains_pii=true, fraud_rt_cdf=enabled, fraud_rt_data_origin=synthetic"
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "table_name",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "tags",
+         "type": "\"string\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    },
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>table_name</th><th>column_name</th><th>tag_name</th><th>tag_value</th></tr></thead><tbody><tr><td>customers</td><td>home_ip</td><td>class.ip_address</td><td></td></tr><tr><td>customers</td><td>home_ip</td><td>fraud_rt_pii_type</td><td>ip</td></tr><tr><td>customers</td><td>phone</td><td>fraud_rt_pii_type</td><td>phone</td></tr><tr><td>customers</td><td>phone</td><td>class.phone_number</td><td></td></tr><tr><td>customers</td><td>primary_device_id</td><td>fraud_rt_pii_type</td><td>device_id</td></tr><tr><td>silver_login</td><td>device_id</td><td>fraud_rt_pii_type</td><td>device_id</td></tr><tr><td>silver_login</td><td>ip</td><td>class.ip_address</td><td></td></tr><tr><td>silver_login</td><td>ip</td><td>fraud_rt_pii_type</td><td>ip</td></tr><tr><td>silver_otp</td><td>device_id</td><td>fraud_rt_pii_type</td><td>device_id</td></tr><tr><td>silver_otp</td><td>phone</td><td>fraud_rt_pii_type</td><td>phone</td></tr><tr><td>silver_otp</td><td>phone</td><td>class.phone_number</td><td></td></tr><tr><td>silver_screen_view</td><td>device_id</td><td>fraud_rt_pii_type</td><td>device_id</td></tr><tr><td>silver_transfers</td><td>device_id</td><td>fraud_rt_pii_type</td><td>device_id</td></tr><tr><td>silver_transfers</td><td>ip</td><td>fraud_rt_pii_type</td><td>ip</td></tr><tr><td>silver_transfers</td><td>ip</td><td>class.ip_address</td><td></td></tr><tr><td>silver_transfers</td><td>is_fraud</td><td>fraud_rt_ml_role</td><td>label</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "customers",
+         "home_ip",
+         "class.ip_address",
+         ""
+        ],
+        [
+         "customers",
+         "home_ip",
+         "fraud_rt_pii_type",
+         "ip"
+        ],
+        [
+         "customers",
+         "phone",
+         "fraud_rt_pii_type",
+         "phone"
+        ],
+        [
+         "customers",
+         "phone",
+         "class.phone_number",
+         ""
+        ],
+        [
+         "customers",
+         "primary_device_id",
+         "fraud_rt_pii_type",
+         "device_id"
+        ],
+        [
+         "silver_login",
+         "device_id",
+         "fraud_rt_pii_type",
+         "device_id"
+        ],
+        [
+         "silver_login",
+         "ip",
+         "class.ip_address",
+         ""
+        ],
+        [
+         "silver_login",
+         "ip",
+         "fraud_rt_pii_type",
+         "ip"
+        ],
+        [
+         "silver_otp",
+         "device_id",
+         "fraud_rt_pii_type",
+         "device_id"
+        ],
+        [
+         "silver_otp",
+         "phone",
+         "fraud_rt_pii_type",
+         "phone"
+        ],
+        [
+         "silver_otp",
+         "phone",
+         "class.phone_number",
+         ""
+        ],
+        [
+         "silver_screen_view",
+         "device_id",
+         "fraud_rt_pii_type",
+         "device_id"
+        ],
+        [
+         "silver_transfers",
+         "device_id",
+         "fraud_rt_pii_type",
+         "device_id"
+        ],
+        [
+         "silver_transfers",
+         "ip",
+         "fraud_rt_pii_type",
+         "ip"
+        ],
+        [
+         "silver_transfers",
+         "ip",
+         "class.ip_address",
+         ""
+        ],
+        [
+         "silver_transfers",
+         "is_fraud",
+         "fraud_rt_ml_role",
+         "label"
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "table_name",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "column_name",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "tag_name",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "tag_value",
+         "type": "\"string\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    },
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>table_name</th><th>comment</th></tr></thead><tbody><tr><td>bronze_login</td><td>Bronze: raw Kinesis-shaped login records (partitionKey, sequenceNumber, approximateArrivalTimestamp, data) ingested append-only by Auto Loader from the raw_events/login volume folder. Synthetic data.</td></tr><tr><td>bronze_otp</td><td>Bronze: raw Kinesis-shaped OTP records (sent/failed/verified) ingested append-only by Auto Loader from the raw_events/otp volume folder. Synthetic data.</td></tr><tr><td>bronze_screen_view</td><td>Bronze: raw Kinesis-shaped app screen-view records ingested append-only by Auto Loader from the raw_events/screen_view volume folder. Synthetic data.</td></tr><tr><td>bronze_transfers</td><td>Bronze: raw Kinesis-shaped remittance transfer records (incl. synthetic is_fraud label) ingested append-only by Auto Loader from the raw_events/transfers volume folder. Synthetic data.</td></tr><tr><td>customers</td><td>Synthetic customer dimension for the remittance fraud prototype (5K customers). Contains masked PII (phone, primary_device_id, home_ip). No fraud label by design.</td></tr><tr><td>event_log_f0ebf391_297c_4036_8ee5_64c1f5b80a90</td><td>null</td></tr><tr><td>silver_login</td><td>Silver: typed, deduplicated (on Kinesis sequenceNumber) login events, one row per login attempt. Append-only with Change Data Feed enabled; source for per-customer streaming features. Synthetic data.</td></tr><tr><td>silver_otp</td><td>Silver: typed, deduplicated (on Kinesis sequenceNumber) OTP events: one row per OTP sent/failed/verified. Append-only with Change Data Feed enabled; source for failed-OTP burst features. Synthetic data.</td></tr><tr><td>silver_screen_view</td><td>Silver: typed, deduplicated (on Kinesis sequenceNumber) app screen views with dwell time. Append-only with Change Data Feed enabled; source for screen-hop and Last-N screen features. Synthetic data.</td></tr><tr><td>silver_transfers</td><td>Silver: typed, deduplicated (on Kinesis sequenceNumber) remittance transfers, one row per transfer_id. is_fraud is the synthetic ground-truth label (training only, never a model input). Append-only with Change Data Feed enabled. Synthetic data.</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "bronze_login",
+         "Bronze: raw Kinesis-shaped login records (partitionKey, sequenceNumber, approximateArrivalTimestamp, data) ingested append-only by Auto Loader from the raw_events/login volume folder. Synthetic data."
+        ],
+        [
+         "bronze_otp",
+         "Bronze: raw Kinesis-shaped OTP records (sent/failed/verified) ingested append-only by Auto Loader from the raw_events/otp volume folder. Synthetic data."
+        ],
+        [
+         "bronze_screen_view",
+         "Bronze: raw Kinesis-shaped app screen-view records ingested append-only by Auto Loader from the raw_events/screen_view volume folder. Synthetic data."
+        ],
+        [
+         "bronze_transfers",
+         "Bronze: raw Kinesis-shaped remittance transfer records (incl. synthetic is_fraud label) ingested append-only by Auto Loader from the raw_events/transfers volume folder. Synthetic data."
+        ],
+        [
+         "customers",
+         "Synthetic customer dimension for the remittance fraud prototype (5K customers). Contains masked PII (phone, primary_device_id, home_ip). No fraud label by design."
+        ],
+        [
+         "event_log_f0ebf391_297c_4036_8ee5_64c1f5b80a90",
+         null
+        ],
+        [
+         "silver_login",
+         "Silver: typed, deduplicated (on Kinesis sequenceNumber) login events, one row per login attempt. Append-only with Change Data Feed enabled; source for per-customer streaming features. Synthetic data."
+        ],
+        [
+         "silver_otp",
+         "Silver: typed, deduplicated (on Kinesis sequenceNumber) OTP events: one row per OTP sent/failed/verified. Append-only with Change Data Feed enabled; source for failed-OTP burst features. Synthetic data."
+        ],
+        [
+         "silver_screen_view",
+         "Silver: typed, deduplicated (on Kinesis sequenceNumber) app screen views with dwell time. Append-only with Change Data Feed enabled; source for screen-hop and Last-N screen features. Synthetic data."
+        ],
+        [
+         "silver_transfers",
+         "Silver: typed, deduplicated (on Kinesis sequenceNumber) remittance transfers, one row per transfer_id. is_fraud is the synthetic ground-truth label (training only, never a model input). Append-only with Change Data Feed enabled. Synthetic data."
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{\"comment\": \"Name of the relation.\"}",
+         "name": "table_name",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{\"comment\": \"An optional comment that describes the relation.\"}",
+         "name": "comment",
+         "type": "\"string\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "display(spark.sql(f\"\"\"\n",
+    "    SELECT table_name, column_name, mask_name FROM `{CATALOG}`.information_schema.column_masks\n",
+    "    WHERE table_schema = '{SCHEMA}' ORDER BY 1, 2\"\"\"))\n",
+    "display(spark.sql(f\"\"\"\n",
+    "    SELECT table_name, concat_ws(', ', collect_list(concat(tag_name, '=', tag_value))) AS tags\n",
+    "    FROM `{CATALOG}`.information_schema.table_tags WHERE schema_name = '{SCHEMA}' GROUP BY 1 ORDER BY 1\"\"\"))\n",
+    "display(spark.sql(f\"\"\"\n",
+    "    SELECT table_name, column_name, tag_name, tag_value FROM `{CATALOG}`.information_schema.column_tags\n",
+    "    WHERE schema_name = '{SCHEMA}' ORDER BY 1, 2\"\"\"))\n",
+    "display(spark.sql(f\"\"\"\n",
+    "    SELECT table_name, comment FROM `{CATALOG}`.information_schema.tables\n",
+    "    WHERE table_schema = '{SCHEMA}' AND table_name NOT LIKE '\\\\_\\\\_materialization%' ORDER BY 1\"\"\"))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794615450777,
+     "inputWidgets": {},
+     "nuid": "3e0fd85a-1006-4852-afc8-70c9390707dd",
+     "showTitle": true,
+     "startTime": 1794615448937,
+     "submitTime": 1794615448885,
+     "tableResultSettingsMap": {},
+     "title": "What a privileged vs non-privileged user sees"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>customer_id</th><th>event_ts</th><th>status</th><th>phone_as_seen_by_me</th><th>phone_non_privileged_view</th><th>device_as_seen_by_me</th><th>device_non_privileged_view</th><th>i_am_privileged</th></tr></thead><tbody><tr><td>C000660</td><td>2026-11-10T20:01:49.722Z</td><td>failed</td><td>+1-555-420-7244</td><td>***-***-7244</td><td>dev-38e63e84890d</td><td>dev-52934d66aed4</td><td>true</td></tr><tr><td>C002684</td><td>2026-10-15T06:52:38.168Z</td><td>failed</td><td>+1-555-272-9571</td><td>***-***-9571</td><td>dev-9af4f306dd68</td><td>dev-5466419ddab7</td><td>true</td></tr><tr><td>C001802</td><td>2026-10-15T21:09:10.043Z</td><td>failed</td><td>+1-555-972-8549</td><td>***-***-8549</td><td>dev-02c7a7b15ff7</td><td>dev-a774a1f98056</td><td>true</td></tr><tr><td>C000466</td><td>2026-11-13T00:39:33.564Z</td><td>failed</td><td>+1-555-795-5521</td><td>***-***-5521</td><td>dev-e862ac4c38e6</td><td>dev-e3e5ff11d822</td><td>true</td></tr><tr><td>C004698</td><td>2026-11-11T10:39:54.403Z</td><td>failed</td><td>+1-555-733-8928</td><td>***-***-8928</td><td>dev-438500cbfdbf</td><td>dev-681258dece06</td><td>true</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "C000660",
+         "2026-11-10T20:01:49.722Z",
+         "failed",
+         "+1-555-420-7244",
+         "***-***-7244",
+         "dev-38e63e84890d",
+         "dev-52934d66aed4",
+         true
+        ],
+        [
+         "C002684",
+         "2026-10-15T06:52:38.168Z",
+         "failed",
+         "+1-555-272-9571",
+         "***-***-9571",
+         "dev-9af4f306dd68",
+         "dev-5466419ddab7",
+         true
+        ],
+        [
+         "C001802",
+         "2026-10-15T21:09:10.043Z",
+         "failed",
+         "+1-555-972-8549",
+         "***-***-8549",
+         "dev-02c7a7b15ff7",
+         "dev-a774a1f98056",
+         true
+        ],
+        [
+         "C000466",
+         "2026-11-13T00:39:33.564Z",
+         "failed",
+         "+1-555-795-5521",
+         "***-***-5521",
+         "dev-e862ac4c38e6",
+         "dev-e3e5ff11d822",
+         true
+        ],
+        [
+         "C004698",
+         "2026-11-11T10:39:54.403Z",
+         "failed",
+         "+1-555-733-8928",
+         "***-***-8928",
+         "dev-438500cbfdbf",
+         "dev-681258dece06",
+         true
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{\"comment\": \"Synthetic customer key\"}",
+         "name": "customer_id",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{\"comment\": \"Event time (UTC) reported by the app\"}",
+         "name": "event_ts",
+         "type": "\"timestamp\""
+        },
+        {
+         "metadata": "{\"comment\": \"sent, failed or verified\"}",
+         "name": "status",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{\"comment\": \"PII. Phone the OTP was sent to; masked for non-privileged users\"}",
+         "name": "phone_as_seen_by_me",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "phone_non_privileged_view",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{\"comment\": \"PII. Device identifier; masked for non-privileged users\"}",
+         "name": "device_as_seen_by_me",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "device_non_privileged_view",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "i_am_privileged",
+         "type": "\"boolean\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "# Current user is in the privileged group, so table reads return clear values.\n",
+    "# The \"non_privileged_view\" columns evaluate the exact ELSE branch of each mask function to show what other users get.\n",
+    "display(spark.sql(f\"\"\"\n",
+    "    SELECT customer_id, event_ts, status,\n",
+    "           phone AS phone_as_seen_by_me, concat('***-***-', right(phone, 4)) AS phone_non_privileged_view,\n",
+    "           device_id AS device_as_seen_by_me, concat('dev-', substr(sha2(device_id, 256), 1, 12)) AS device_non_privileged_view,\n",
+    "           (is_member('{PII_GROUP}') OR is_account_group_member('{PII_GROUP}')) AS i_am_privileged\n",
+    "    FROM {FQ}.silver_otp WHERE status = 'failed' LIMIT 5\"\"\"))"
+   ]
+  }
+ ],
+ "metadata": {
+  "application/vnd.databricks.v1+notebook": {
+   "computePreferences": null,
+   "dashboards": [],
+   "environmentMetadata": {
+    "base_environment": "",
+    "environment_version": "6"
+   },
+   "inputWidgetPreferences": null,
+   "language": "python",
+   "notebookMetadata": {
+    "pythonIndentUnit": 4
+   },
+   "notebookName": "03_governance",
+   "widgets": {
+    "catalog": {
+     "currentValue": "mlo_serverless_stable_catalog",
+     "nuid": "31200404-e504-4067-a00c-e9661dfaab62",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "mlo_serverless_stable_catalog",
+      "label": null,
+      "name": "catalog",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "mlo_serverless_stable_catalog",
+      "label": null,
+      "name": "catalog",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": null,
+       "validationRegex": null
+      }
+     }
+    },
+    "pii_admin_group": {
+     "currentValue": "admins",
+     "nuid": "677e69a8-8a4b-4654-9f66-230d7e7e23b3",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "admins",
+      "label": null,
+      "name": "pii_admin_group",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "admins",
+      "label": null,
+      "name": "pii_admin_group",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": null,
+       "validationRegex": null
+      }
+     }
+    },
+    "schema": {
+     "currentValue": "fraud_rt",
+     "nuid": "e9931804-6b9e-4b82-a8b8-4f6c650f6d22",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "fraud_rt",
+      "label": null,
+      "name": "schema",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "fraud_rt",
+      "label": null,
+      "name": "schema",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": null,
+       "validationRegex": null
+      }
+     }
+    }
+   }
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}
