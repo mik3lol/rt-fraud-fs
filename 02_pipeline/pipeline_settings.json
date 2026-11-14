@@ -1,0 +1,20 @@
+{
+  "name": "fraud_rt_02_pipeline",
+  "pipeline_id": "f0ebf391-297c-4036-8ee5-64c1f5b80a90",
+  "serverless": true,
+  "photon": true,
+  "channel": "CURRENT",
+  "continuous": false,
+  "development": true,
+  "catalog": "mlo_serverless_stable_catalog",
+  "schema": "fraud_rt",
+  "root_path": "/Workspace/Users/mike.lo@databricks.com/rt-fraud-fs/02_pipeline",
+  "libraries": [
+    {"glob": {"include": "/Workspace/Users/mike.lo@databricks.com/rt-fraud-fs/02_pipeline/transformations/**"}}
+  ],
+  "configuration": {
+    "raw_events_path": "/Volumes/mlo_serverless_stable_catalog/fraud_rt/raw_events",
+    "governance_schema": "mlo_serverless_stable_catalog.fraud_rt"
+  },
+  "tags": {"project": "fe_bar_fraud_rt"}
+}
