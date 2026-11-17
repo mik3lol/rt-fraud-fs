@@ -66,7 +66,7 @@ ASCII fallback:
 | `notebooks/07_genie_space` | Genie space definition (silver + gold tables, instructions, validated example SQL, sample questions), create/update, smoke question |
 | `notebooks/08_gold_tables` | `gold_scored_transfers` and `gold_daily_fraud_summary` for Genie |
 | `app/` | Streamlit review-queue app (`app.py`, `app.yaml`, `requirements.txt`) |
-| `FE Bar Fraud RT - Silver Events.geniespace.json` | The Genie space asset |
+| `genie/genie_space_config.json` | Export of the Genie space (id, tables, instructions, example SQL, sample questions). The space asset itself lives in the workspace folder but is git-ignored, because Git folders cannot hold Genie space assets |
 | `run_evidence/*.ipynb.json`, `run_evidence/*.job_run.html` | Run evidence: Jupyter exports with outputs for interactively run notebooks, and rendered job-run outputs for `07` and `08` (run as a one-time job); see Git below |
 
 ## How to run
