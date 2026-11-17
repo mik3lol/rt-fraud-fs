@@ -1,0 +1,19 @@
+command:
+  - streamlit
+  - run
+  - app.py
+  - --server.headless=true
+
+# No secrets here: Lakebase uses short-lived OAuth tokens minted for the app's service principal,
+# and the SQL warehouse is called with the same service principal identity.
+env:
+  - name: LAKEBASE_ENDPOINT
+    value: projects/fraud-rt-online/branches/production/endpoints/primary
+  - name: LAKEBASE_DATABASE
+    value: databricks_postgres
+  - name: WAREHOUSE_ID
+    value: bf8a061e0b800955
+  - name: FRAUD_CATALOG
+    value: mlo_serverless_stable_catalog
+  - name: FRAUD_SCHEMA
+    value: fraud_rt

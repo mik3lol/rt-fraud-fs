@@ -1,0 +1,2 @@
+# Genie space assets are not supported by Git folders; the space config is exported to genie/genie_space_config.json
+*.geniespace.json

@@ -1,0 +1,815 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {},
+     "inputWidgets": {},
+     "nuid": "ae73d3ab-2b10-4b99-9565-eedc4601b902",
+     "showTitle": true,
+     "tableResultSettingsMap": {},
+     "title": "Overview"
+    }
+   },
+   "source": [
+    "# 06 - Lakebase analyst review queue (step 7)\n",
+    "\n",
+    "Scores recent transfers with the model version currently served by `transfer-fraud-model` and loads the top-scored ones into a Lakebase (Postgres) review queue that the Streamlit app reads and writes.\n",
+    "\n",
+    "* **Where:** Lakebase project `fraud-rt-online`, database `databricks_postgres`, schema `fraud_review` (separate from the feature-store online tables in database `mlo_serverless_stable_catalog`).\n",
+    "* **Tables:** `review_queue` (one row per flagged transfer: score, threshold, model version, status `pending/approved/rejected/escalated`, reviewer, notes) and `review_actions` (append-only audit log of analyst actions).\n",
+    "* **Scoring:** `fe.score_batch` with point-in-time feature lookups from the offline Feature Views, so each transfer is scored with the features it had at transfer time. The endpoint uses online features (the latest window), which is right for new transfers but wrong for re-scoring past ones.\n",
+    "* **Flag rule:** the top `flag_top_pct` (default 2%) of scores in the lookback window, matching the precision/recall at top 2% metric from `05_train_model`. The threshold is stored on each row.\n",
+    "* **Upsert rule:** re-runs refresh scores only for rows still `pending`; analyst decisions are never overwritten."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794868286965,
+     "inputWidgets": {},
+     "nuid": "bd29e80a-2336-43af-b0b2-b808efb4c907",
+     "showTitle": true,
+     "startTime": 1794868266952,
+     "submitTime": 1794868265739,
+     "tableResultSettingsMap": {},
+     "title": "Install libraries"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\u001B[43mNote: you may need to restart the kernel using %restart_python or dbutils.library.restartPython() to use updated packages.\u001B[0m\n"
+     ]
+    }
+   ],
+   "source": [
+    "%pip install -q \"databricks-feature-engineering>=0.17\" lightgbm \"psycopg[binary]\" \"databricks-sdk>=0.118.0\"\n",
+    "dbutils.library.restartPython()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794868294357,
+     "inputWidgets": {},
+     "nuid": "d6a62c53-ec47-4eb2-8628-52e306b42f85",
+     "showTitle": true,
+     "startTime": 1794868290452,
+     "submitTime": 1794868290372,
+     "tableResultSettingsMap": {},
+     "title": "Parameters and served model version"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "models:/mlo_serverless_stable_catalog.fraud_rt.transfer_fraud_model/2 | lookback 7 days | flag top 2.0 %\n"
+     ]
+    }
+   ],
+   "source": [
+    "import time\n",
+    "import pandas as pd\n",
+    "import psycopg\n",
+    "from pyspark.sql import functions as F\n",
+    "from databricks.sdk import WorkspaceClient\n",
+    "from databricks.sdk.service.serving import EndpointStateConfigUpdate\n",
+    "from databricks.feature_engineering import FeatureEngineeringClient\n",
+    "\n",
+    "dbutils.widgets.text(\"catalog\", \"mlo_serverless_stable_catalog\")\n",
+    "dbutils.widgets.text(\"schema\", \"fraud_rt\")\n",
+    "dbutils.widgets.text(\"lookback_days\", \"7\")\n",
+    "dbutils.widgets.text(\"flag_top_pct\", \"2\")\n",
+    "CATALOG, SCHEMA = dbutils.widgets.get(\"catalog\"), dbutils.widgets.get(\"schema\")\n",
+    "LOOKBACK_DAYS = int(dbutils.widgets.get(\"lookback_days\"))\n",
+    "FLAG_TOP_PCT = float(dbutils.widgets.get(\"flag_top_pct\"))\n",
+    "MODEL_NAME = f\"{CATALOG}.{SCHEMA}.transfer_fraud_model\"\n",
+    "ENDPOINT = \"transfer-fraud-model\"\n",
+    "LAKEBASE_EP = \"projects/fraud-rt-online/branches/production/endpoints/primary\"\n",
+    "PG_DB = \"databricks_postgres\"\n",
+    "\n",
+    "w = WorkspaceClient()\n",
+    "fe = FeatureEngineeringClient()\n",
+    "\n",
+    "# Queue scores must come from the same model version the endpoint serves; wait out an in-flight config update.\n",
+    "for _ in range(90):\n",
+    "    ep = w.serving_endpoints.get(ENDPOINT)\n",
+    "    if ep.state.config_update != EndpointStateConfigUpdate.IN_PROGRESS:\n",
+    "        break\n",
+    "    time.sleep(20)\n",
+    "assert ep.state.config_update != EndpointStateConfigUpdate.IN_PROGRESS, \"endpoint still updating\"\n",
+    "served = [e for e in ep.config.served_entities if e.entity_name == MODEL_NAME]\n",
+    "assert len(served) == 1, served\n",
+    "MODEL_VERSION = served[0].entity_version\n",
+    "MODEL_URI = f\"models:/{MODEL_NAME}/{MODEL_VERSION}\"\n",
+    "print(MODEL_URI, \"| lookback\", LOOKBACK_DAYS, \"days | flag top\", FLAG_TOP_PCT, \"%\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794868297960,
+     "inputWidgets": {},
+     "nuid": "1bdd02d9-e519-4fa5-8ed9-abfaf181d5e0",
+     "showTitle": true,
+     "startTime": 1794868297407,
+     "submitTime": 1794868297342,
+     "tableResultSettingsMap": {},
+     "title": "Lakebase connection and queue DDL"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[('review_actions', 7), ('review_queue', 16)]\n"
+     ]
+    }
+   ],
+   "source": [
+    "PG_HOST = w.postgres.get_endpoint(name=LAKEBASE_EP).status.hosts.host\n",
+    "PG_USER = w.current_user.me().user_name\n",
+    "\n",
+    "def pg_connect():\n",
+    "    # Short-lived OAuth token (1h); minted per connection, never stored.\n",
+    "    token = w.postgres.generate_database_credential(endpoint=LAKEBASE_EP).token\n",
+    "    return psycopg.connect(host=PG_HOST, dbname=PG_DB, user=PG_USER, password=token, sslmode=\"require\")\n",
+    "\n",
+    "DDL = \"\"\"\n",
+    "CREATE SCHEMA IF NOT EXISTS fraud_review;\n",
+    "CREATE TABLE IF NOT EXISTS fraud_review.review_queue (\n",
+    "  transfer_id     text PRIMARY KEY,\n",
+    "  customer_id     text NOT NULL,\n",
+    "  corridor        text NOT NULL,\n",
+    "  payout_method   text,\n",
+    "  amount_usd      numeric(12,2),\n",
+    "  transfer_ts     timestamptz NOT NULL,\n",
+    "  fraud_score     double precision NOT NULL CHECK (fraud_score BETWEEN 0 AND 1),\n",
+    "  score_threshold double precision NOT NULL,\n",
+    "  model_name      text NOT NULL,\n",
+    "  model_version   text NOT NULL,\n",
+    "  scored_at       timestamptz NOT NULL DEFAULT now(),\n",
+    "  status          text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected','escalated')),\n",
+    "  reviewer        text,\n",
+    "  reviewed_at     timestamptz,\n",
+    "  review_notes    text,\n",
+    "  updated_at      timestamptz NOT NULL DEFAULT now()\n",
+    ");\n",
+    "CREATE INDEX IF NOT EXISTS review_queue_status_score_idx ON fraud_review.review_queue (status, fraud_score DESC);\n",
+    "CREATE INDEX IF NOT EXISTS review_queue_customer_idx ON fraud_review.review_queue (customer_id);\n",
+    "CREATE TABLE IF NOT EXISTS fraud_review.review_actions (\n",
+    "  action_id    bigserial PRIMARY KEY,\n",
+    "  transfer_id  text NOT NULL REFERENCES fraud_review.review_queue(transfer_id),\n",
+    "  old_status   text,\n",
+    "  new_status   text NOT NULL,\n",
+    "  reviewer     text NOT NULL,\n",
+    "  notes        text,\n",
+    "  acted_at     timestamptz NOT NULL DEFAULT now()\n",
+    ");\n",
+    "COMMENT ON TABLE fraud_review.review_queue IS 'Analyst review queue: transfers flagged by transfer_fraud_model (score >= threshold). Synthetic data.';\n",
+    "COMMENT ON TABLE fraud_review.review_actions IS 'Append-only audit log of analyst approve/reject/escalate actions.';\n",
+    "\"\"\"\n",
+    "with pg_connect() as conn:\n",
+    "    conn.execute(DDL)\n",
+    "    print(conn.execute(\"\"\"SELECT table_name, count(*) FROM information_schema.columns\n",
+    "                           WHERE table_schema = 'fraud_review' GROUP BY table_name ORDER BY 1\"\"\").fetchall())"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794868693961,
+     "inputWidgets": {},
+     "nuid": "80895b81-31d3-448a-bd07-db0ace574964",
+     "showTitle": true,
+     "startTime": 1794868556615,
+     "submitTime": 1794868556570,
+     "tableResultSettingsMap": {},
+     "title": "Batch score recent transfers (point-in-time features)"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "display_data",
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "f7c40d0073794511a69552eb0fd59288",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "output_type": "stream",
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Unexpected status resolving file endpoints (403, request ID 1d919d8d-e0f6-46f9-a23d-f1a6cdf54e12), using the default endpoints.\n"
+     ]
+    },
+    {
+     "output_type": "display_data",
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "c8bcc8b0018244529f882d4841b38d37",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "output_type": "stream",
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Unexpected status resolving file endpoints (403, request ID 341f1de4-5134-4969-8dba-1eecb85710df), using the default endpoints.\n"
+     ]
+    },
+    {
+     "output_type": "display_data",
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "8004332b249c4552a33a5fddc8e9414e",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "Downloading artifacts:   0%|          | 0/5 [00:00<?, ?it/s]"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "output_type": "stream",
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Unexpected status resolving file endpoints (403, request ID bc9b5774-7c2e-41fd-9550-3e0322a5ddd6), using the default endpoints.\n2026/11/16 22:36:04 WARNING mlflow.pyfunc: Calling `spark_udf()` with `env_manager=\"local\"` does not recreate the same environment that was used during training, which may lead to errors or inaccurate predictions. We recommend specifying `env_manager=\"conda\"`, which automatically recreates the environment that was used to train the model and performs inference in the recreated environment.\n"
+     ]
+    },
+    {
+     "output_type": "display_data",
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "1b724e9480cc46ceb843ab386e2dd0a6",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "Downloading artifacts:   0%|          | 0/6 [00:00<?, ?it/s]"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "output_type": "stream",
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "2026/11/16 22:36:04 INFO mlflow.models.flavor_backend_registry: Selected backend for flavor 'python_function'\n"
+     ]
+    },
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "dropped 436 older rows that reuse a transfer_id\n3794 transfers scored | 2026-11-09 21:59:36.164000 -> 2026-11-16 21:57:06.936000\ncount    3794.0000\nmean        0.0066\nstd         0.0711\nmin         0.0000\n25%         0.0000\n50%         0.0000\n75%         0.0000\nmax         1.0000\n"
+     ]
+    }
+   ],
+   "source": [
+    "recent = (spark.table(f\"{CATALOG}.{SCHEMA}.silver_transfers\")\n",
+    "          .where(F.col(\"ts\") >= F.expr(f\"(SELECT max(ts) FROM {CATALOG}.{SCHEMA}.silver_transfers) - INTERVAL {LOOKBACK_DAYS} DAYS\"))\n",
+    "          .select(\"transfer_id\", \"customer_id\", \"corridor\", \"ts\", F.col(\"ts\").alias(\"event_ts\"),\n",
+    "                  \"payout_method\", \"amount_usd\", \"is_fraud\"))\n",
+    "\n",
+    "# score_batch looks up each Feature View as of the row's timestamps, like the training set.\n",
+    "scored = fe.score_batch(model_uri=MODEL_URI, df=recent, result_type=\"double\")\n",
+    "spd = scored.select(\"transfer_id\", \"customer_id\", \"corridor\", \"payout_method\", \"amount_usd\", \"ts\", \"is_fraud\",\n",
+    "                    F.col(\"prediction\").alias(\"fraud_score\")).toPandas()\n",
+    "# Known generator issue: live runs reuse the fixed seed, so some transfer_ids repeat at different times\n",
+    "# (distinct sequence numbers). The queue is keyed by transfer_id, so keep the latest occurrence of each.\n",
+    "n_before = len(spd)\n",
+    "spd = spd.sort_values(\"ts\").drop_duplicates(\"transfer_id\", keep=\"last\").reset_index(drop=True)\n",
+    "print(f\"dropped {n_before - len(spd)} older rows that reuse a transfer_id\")\n",
+    "assert spd[\"fraud_score\"].between(0, 1).all(), \"model must return probabilities\"\n",
+    "assert spd[\"fraud_score\"].nunique() > 2, \"scores look like 0/1 labels, not probabilities\"\n",
+    "print(len(spd), \"transfers scored |\", spd.ts.min(), \"->\", spd.ts.max())\n",
+    "print(spd[\"fraud_score\"].describe().round(4).to_string())"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794868703901,
+     "inputWidgets": {},
+     "nuid": "3bd53530-7bc6-4342-9d68-77b65e141fad",
+     "showTitle": true,
+     "startTime": 1794868697616,
+     "submitTime": 1794868697564,
+     "tableResultSettingsMap": {},
+     "title": "Flag the top-scored transfers"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "threshold=0.0049 flagged=76 of 3794 | in-sample label check: 14 fraud in queue (18.4% precision), 14/14 fraud in window caught (100.0% recall)\n"
+     ]
+    },
+    {
+     "output_type": "display_data",
+     "data": {
+      "text/html": [
+       "<style scoped>\n",
+       "  .table-result-container {\n",
+       "    max-height: 300px;\n",
+       "    overflow: auto;\n",
+       "  }\n",
+       "  table, th, td {\n",
+       "    border: 1px solid black;\n",
+       "    border-collapse: collapse;\n",
+       "  }\n",
+       "  th, td {\n",
+       "    padding: 5px;\n",
+       "  }\n",
+       "  th {\n",
+       "    text-align: left;\n",
+       "  }\n",
+       "</style><div class='table-result-container'><table class='table-result'><thead style='background-color: white'><tr><th>transfer_id</th><th>customer_id</th><th>corridor</th><th>payout_method</th><th>amount_usd</th><th>ts</th><th>is_fraud</th><th>fraud_score</th></tr></thead><tbody><tr><td>d0711280-8a6b-4766-8948-5c0a767ae3ca</td><td>C001699</td><td>US-PH</td><td>mobile_wallet</td><td>4848.94</td><td>2026-11-16T21:56:24.771Z</td><td>1</td><td>0.999996308101089</td></tr><tr><td>841329bf-8f81-450e-b157-1fa17be604f3</td><td>C002084</td><td>US-GT</td><td>cash_pickup</td><td>800.00</td><td>2026-11-16T21:55:10.019Z</td><td>1</td><td>0.9999941933693589</td></tr><tr><td>a48c089b-1b77-4120-8789-0ea3c795fbf1</td><td>C002736</td><td>US-IN</td><td>mobile_wallet</td><td>1715.99</td><td>2026-11-13T00:40:43.474Z</td><td>1</td><td>0.999992173094096</td></tr><tr><td>e7f3c65d-e29a-427a-a766-05729955c496</td><td>C004940</td><td>US-NG</td><td>mobile_wallet</td><td>3407.20</td><td>2026-11-16T21:56:21.678Z</td><td>1</td><td>0.9999853891769903</td></tr><tr><td>afa87701-99ff-4b9f-bb5c-7c4015e56e3c</td><td>C001514</td><td>US-IN</td><td>mobile_wallet</td><td>7621.15</td><td>2026-11-16T21:55:38.833Z</td><td>1</td><td>0.9999843144620709</td></tr><tr><td>0d87faad-7019-49c1-b686-630a959a2fa3</td><td>C002897</td><td>US-MX</td><td>mobile_wallet</td><td>6005.77</td><td>2026-11-16T21:55:56.633Z</td><td>1</td><td>0.9999841368583752</td></tr><tr><td>f0222ad5-5ae7-40ed-b50f-b495f2848b03</td><td>C002489</td><td>US-PH</td><td>cash_pickup</td><td>1142.40</td><td>2026-11-16T21:55:20.123Z</td><td>1</td><td>0.9999834685588908</td></tr><tr><td>7b59123f-9a18-41e0-8f4a-da1cd2de974a</td><td>C000167</td><td>US-MX</td><td>cash_pickup</td><td>1665.43</td><td>2026-11-16T21:55:26.407Z</td><td>1</td><td>0.9999828543307139</td></tr><tr><td>cfe345fb-9ec6-4094-8be7-01f69cb7a632</td><td>C000466</td><td>US-MX</td><td>mobile_wallet</td><td>3753.24</td><td>2026-11-13T00:40:35.493Z</td><td>1</td><td>0.9999798070994045</td></tr><tr><td>e6440c72-8b6a-4ba3-a5d5-ac643ced590b</td><td>C003474</td><td>US-GT</td><td>mobile_wallet</td><td>3441.19</td><td>2026-11-16T21:55:47.033Z</td><td>1</td><td>0.9999669876114112</td></tr></tbody></table></div>"
+      ]
+     },
+     "metadata": {
+      "application/vnd.databricks.v1+output": {
+       "addedWidgets": {},
+       "aggData": [],
+       "aggError": "",
+       "aggOverflow": false,
+       "aggSchema": [],
+       "aggSeriesLimitReached": false,
+       "aggType": "",
+       "arguments": {},
+       "columnCustomDisplayInfos": {},
+       "data": [
+        [
+         "d0711280-8a6b-4766-8948-5c0a767ae3ca",
+         "C001699",
+         "US-PH",
+         "mobile_wallet",
+         "4848.94",
+         "2026-11-16T21:56:24.771Z",
+         1,
+         0.999996308101089
+        ],
+        [
+         "841329bf-8f81-450e-b157-1fa17be604f3",
+         "C002084",
+         "US-GT",
+         "cash_pickup",
+         "800.00",
+         "2026-11-16T21:55:10.019Z",
+         1,
+         0.9999941933693589
+        ],
+        [
+         "a48c089b-1b77-4120-8789-0ea3c795fbf1",
+         "C002736",
+         "US-IN",
+         "mobile_wallet",
+         "1715.99",
+         "2026-11-13T00:40:43.474Z",
+         1,
+         0.999992173094096
+        ],
+        [
+         "e7f3c65d-e29a-427a-a766-05729955c496",
+         "C004940",
+         "US-NG",
+         "mobile_wallet",
+         "3407.20",
+         "2026-11-16T21:56:21.678Z",
+         1,
+         0.9999853891769903
+        ],
+        [
+         "afa87701-99ff-4b9f-bb5c-7c4015e56e3c",
+         "C001514",
+         "US-IN",
+         "mobile_wallet",
+         "7621.15",
+         "2026-11-16T21:55:38.833Z",
+         1,
+         0.9999843144620709
+        ],
+        [
+         "0d87faad-7019-49c1-b686-630a959a2fa3",
+         "C002897",
+         "US-MX",
+         "mobile_wallet",
+         "6005.77",
+         "2026-11-16T21:55:56.633Z",
+         1,
+         0.9999841368583752
+        ],
+        [
+         "f0222ad5-5ae7-40ed-b50f-b495f2848b03",
+         "C002489",
+         "US-PH",
+         "cash_pickup",
+         "1142.40",
+         "2026-11-16T21:55:20.123Z",
+         1,
+         0.9999834685588908
+        ],
+        [
+         "7b59123f-9a18-41e0-8f4a-da1cd2de974a",
+         "C000167",
+         "US-MX",
+         "cash_pickup",
+         "1665.43",
+         "2026-11-16T21:55:26.407Z",
+         1,
+         0.9999828543307139
+        ],
+        [
+         "cfe345fb-9ec6-4094-8be7-01f69cb7a632",
+         "C000466",
+         "US-MX",
+         "mobile_wallet",
+         "3753.24",
+         "2026-11-13T00:40:35.493Z",
+         1,
+         0.9999798070994045
+        ],
+        [
+         "e6440c72-8b6a-4ba3-a5d5-ac643ced590b",
+         "C003474",
+         "US-GT",
+         "mobile_wallet",
+         "3441.19",
+         "2026-11-16T21:55:47.033Z",
+         1,
+         0.9999669876114112
+        ]
+       ],
+       "datasetInfos": [],
+       "dbfsResultPath": null,
+       "isJsonSchema": true,
+       "metadata": {},
+       "overflow": false,
+       "plotOptions": {
+        "customPlotOptions": {},
+        "displayType": "table",
+        "pivotAggregation": null,
+        "pivotColumns": null,
+        "xColumns": null,
+        "yColumns": null
+       },
+       "removedWidgets": [],
+       "schema": [
+        {
+         "metadata": "{}",
+         "name": "transfer_id",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "customer_id",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "corridor",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "payout_method",
+         "type": "\"string\""
+        },
+        {
+         "metadata": "{}",
+         "name": "amount_usd",
+         "type": "\"decimal(6,2)\""
+        },
+        {
+         "metadata": "{}",
+         "name": "ts",
+         "type": "\"timestamp\""
+        },
+        {
+         "metadata": "{}",
+         "name": "is_fraud",
+         "type": "\"integer\""
+        },
+        {
+         "metadata": "{}",
+         "name": "fraud_score",
+         "type": "\"double\""
+        }
+       ],
+       "type": "table"
+      }
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "THRESHOLD = float(spd[\"fraud_score\"].quantile(1 - FLAG_TOP_PCT / 100))\n",
+    "flagged = spd[spd[\"fraud_score\"] >= THRESHOLD].sort_values(\"fraud_score\", ascending=False).copy()\n",
+    "# Sanity check only: the served model was refit on ALL transfers, so this window is in-sample (see 05 for holdout metrics).\n",
+    "hits, total_fraud = int(flagged.is_fraud.sum()), int(spd.is_fraud.sum())\n",
+    "print(f\"threshold={THRESHOLD:.4f} flagged={len(flagged)} of {len(spd)} \"\n",
+    "      f\"| in-sample label check: {hits} fraud in queue ({hits/len(flagged):.1%} precision), \"\n",
+    "      f\"{hits}/{total_fraud} fraud in window caught ({hits/max(total_fraud,1):.1%} recall)\")\n",
+    "display(flagged.head(10))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794868708195,
+     "inputWidgets": {},
+     "nuid": "eca5063c-28f4-417e-82bd-cbaba23d00df",
+     "showTitle": true,
+     "startTime": 1794868706330,
+     "submitTime": 1794868706287,
+     "tableResultSettingsMap": {},
+     "title": "Upsert into the Lakebase queue"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "upserted 76 rows\n"
+     ]
+    }
+   ],
+   "source": [
+    "UPSERT = \"\"\"\n",
+    "INSERT INTO fraud_review.review_queue\n",
+    "  (transfer_id, customer_id, corridor, payout_method, amount_usd, transfer_ts,\n",
+    "   fraud_score, score_threshold, model_name, model_version)\n",
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)\n",
+    "ON CONFLICT (transfer_id) DO UPDATE SET\n",
+    "  customer_id = EXCLUDED.customer_id, corridor = EXCLUDED.corridor, payout_method = EXCLUDED.payout_method,\n",
+    "  amount_usd = EXCLUDED.amount_usd, transfer_ts = EXCLUDED.transfer_ts,\n",
+    "  fraud_score = EXCLUDED.fraud_score, score_threshold = EXCLUDED.score_threshold,\n",
+    "  model_version = EXCLUDED.model_version, scored_at = now(), updated_at = now()\n",
+    "WHERE fraud_review.review_queue.status = 'pending'\n",
+    "\"\"\"\n",
+    "# is_fraud is the synthetic label: it is NOT written to the queue, so analysts don't see the answer.\n",
+    "rows = [(r.transfer_id, r.customer_id, r.corridor, r.payout_method, float(r.amount_usd),\n",
+    "         pd.Timestamp(r.ts).tz_localize(\"UTC\").to_pydatetime(), float(r.fraud_score), THRESHOLD, MODEL_NAME, str(MODEL_VERSION))\n",
+    "        for r in flagged.itertuples()]\n",
+    "with pg_connect() as conn:\n",
+    "    with conn.cursor() as cur:\n",
+    "        cur.executemany(UPSERT, rows)\n",
+    "print(\"upserted\", len(rows), \"rows\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 0,
+   "metadata": {
+    "application/vnd.databricks.v1+cell": {
+     "cellMetadata": {
+      "byteLimit": 2048000,
+      "rowLimit": 10000
+     },
+     "finishTime": 1794868713420,
+     "inputWidgets": {},
+     "nuid": "7d0c1186-edfc-41ab-9a88-454f855c51a5",
+     "showTitle": true,
+     "startTime": 1794868711519,
+     "submitTime": 1794868711423,
+     "tableResultSettingsMap": {},
+     "title": "Verify the queue against the flagged set"
+    }
+   },
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "queue rows by status: [('pending', 78)] | rows from earlier runs not flagged now: 2\npending rows whose transfer_ts differs from this run: 0\nflagged this run: 76 | missing from queue: 0 | max score diff on pending rows: 0.00e+00\n"
+     ]
+    }
+   ],
+   "source": [
+    "with pg_connect() as conn:\n",
+    "    q = pd.DataFrame(conn.execute(\"\"\"SELECT transfer_id, fraud_score, model_version, status, transfer_ts FROM fraud_review.review_queue\"\"\").fetchall(),\n",
+    "                     columns=[\"transfer_id\", \"fraud_score\", \"model_version\", \"status\", \"transfer_ts\"])\n",
+    "    by_status = conn.execute(\"SELECT status, count(*) FROM fraud_review.review_queue GROUP BY status ORDER BY 1\").fetchall()\n",
+    "\n",
+    "m = flagged[[\"transfer_id\", \"fraud_score\"]].merge(q, on=\"transfer_id\", how=\"left\", suffixes=(\"_spark\", \"_pg\"))\n",
+    "missing = int(m[\"fraud_score_pg\"].isna().sum())\n",
+    "pending = m[m.status == \"pending\"]\n",
+    "max_diff = float((pending.fraud_score_spark - pending.fraud_score_pg).abs().max()) if len(pending) else 0.0\n",
+    "stale = int((~q.transfer_id.isin(flagged.transfer_id)).sum())  # rows from earlier runs no longer in the top set\n",
+    "print(\"queue rows by status:\", by_status, \"| rows from earlier runs not flagged now:\", stale)\n",
+    "m = m.merge(flagged[[\"transfer_id\", \"ts\"]], on=\"transfer_id\")\n",
+    "pending = m[m.status == \"pending\"]\n",
+    "ts_mismatch = int((pending.ts.dt.tz_localize(\"UTC\") != pd.to_datetime(pending.transfer_ts, utc=True)).sum())\n",
+    "print(\"pending rows whose transfer_ts differs from this run:\", ts_mismatch)\n",
+    "print(f\"flagged this run: {len(flagged)} | missing from queue: {missing} | max score diff on pending rows: {max_diff:.2e}\")\n",
+    "assert missing == 0 and max_diff < 1e-9 and ts_mismatch == 0"
+   ]
+  }
+ ],
+ "metadata": {
+  "application/vnd.databricks.v1+notebook": {
+   "computePreferences": null,
+   "dashboards": [],
+   "environmentMetadata": {
+    "base_environment": "",
+    "environment_version": "6"
+   },
+   "inputWidgetPreferences": null,
+   "language": "python",
+   "notebookMetadata": {},
+   "notebookName": "06_review_queue",
+   "widgets": {
+    "catalog": {
+     "currentValue": "mlo_serverless_stable_catalog",
+     "nuid": "5e5a31c8-f301-488c-a12b-6cf1830d38c7",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "mlo_serverless_stable_catalog",
+      "label": null,
+      "name": "catalog",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "mlo_serverless_stable_catalog",
+      "label": null,
+      "name": "catalog",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "flag_top_pct": {
+     "currentValue": "2",
+     "nuid": "b7eb87e3-57e8-4ea8-bafe-a4e3990d9f54",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "2",
+      "label": null,
+      "name": "flag_top_pct",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "2",
+      "label": null,
+      "name": "flag_top_pct",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "lookback_days": {
+     "currentValue": "7",
+     "nuid": "20a1208d-520a-47c8-861e-c0a309030bcb",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "7",
+      "label": null,
+      "name": "lookback_days",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "7",
+      "label": null,
+      "name": "lookback_days",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    },
+    "schema": {
+     "currentValue": "fraud_rt",
+     "nuid": "7d993be0-56fa-479f-94da-f75a6b7d273e",
+     "typedWidgetInfo": {
+      "autoCreated": false,
+      "defaultValue": "fraud_rt",
+      "label": null,
+      "name": "schema",
+      "options": {
+       "widgetDisplayType": "Text",
+       "validationRegex": null
+      },
+      "parameterDataType": "String",
+      "dynamic": false
+     },
+     "widgetInfo": {
+      "widgetType": "text",
+      "defaultValue": "fraud_rt",
+      "label": null,
+      "name": "schema",
+      "options": {
+       "widgetType": "text",
+       "autoCreated": false,
+       "validationRegex": null
+      }
+     }
+    }
+   }
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}

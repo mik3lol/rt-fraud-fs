@@ -1,0 +1,564 @@
+{
+  "space_id": "01f1e20c39141e9da3df2e122d60fbe5",
+  "title": "FE Bar Fraud RT - Silver Events",
+  "description": "Ask questions about synthetic remittance transfers, logins, OTPs and screen views (silver) and model fraud scores and review flags (gold) for the real-time fraud prototype.",
+  "warehouse_id": "bf8a061e0b800955",
+  "serialized_space": {
+    "version": 2,
+    "config": {
+      "sample_questions": [
+        {
+          "id": "01f0c0de000000000000000000000001",
+          "question": [
+            "What is the fraud rate by corridor?"
+          ]
+        },
+        {
+          "id": "01f0c0de000000000000000000000002",
+          "question": [
+            "Which customers had the most failed OTPs in the last 24 hours?"
+          ]
+        },
+        {
+          "id": "01f0c0de000000000000000000000003",
+          "question": [
+            "Show daily transfer volume and fraud count"
+          ]
+        },
+        {
+          "id": "01f0c0de000000000000000000000004",
+          "question": [
+            "Compare average transfer amount for fraud vs legitimate transfers by payout method"
+          ]
+        },
+        {
+          "id": "01f0c0de000000000000000000000005",
+          "question": [
+            "Which screens do fraudsters visit most compared to legitimate customers?"
+          ]
+        },
+        {
+          "id": "01f0c0de000000000000000000000006",
+          "question": [
+            "How many fraud transfers did the model flag, and how many were missed?"
+          ]
+        },
+        {
+          "id": "01f0c0de000000000000000000000007",
+          "question": [
+            "Which corridors had the most flagged transfers in the last 7 days?"
+          ]
+        }
+      ]
+    },
+    "data_sources": {
+      "tables": [
+        {
+          "identifier": "mlo_serverless_stable_catalog.fraud_rt.gold_daily_fraud_summary",
+          "description": [
+            "One row per day, corridor and payout method: transfers, fraud, flagged and flagged-fraud counts and USD amounts (from gold_scored_transfers). Prefer this table for daily trends."
+          ],
+          "column_configs": [
+            {
+              "column_name": "corridor",
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            },
+            {
+              "column_name": "day",
+              "description": [
+                "Transfer date (UTC)"
+              ]
+            },
+            {
+              "column_name": "flagged_fraud_transfers",
+              "description": [
+                "Fraud transfers that the model flagged (caught)"
+              ]
+            },
+            {
+              "column_name": "payout_method",
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            }
+          ]
+        },
+        {
+          "identifier": "mlo_serverless_stable_catalog.fraud_rt.gold_scored_transfers",
+          "description": [
+            "One row per transfer scored by transfer_fraud_model with point-in-time features. fraud_score is the model probability; flagged = 1 when the transfer is in the top-scored share that enters the analyst review queue. Scores are in-sample for history (synthetic)."
+          ],
+          "column_configs": [
+            {
+              "column_name": "corridor",
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            },
+            {
+              "column_name": "flagged",
+              "description": [
+                "1 = flagged for analyst review (fraud_score > score_threshold, top 2% of scores)"
+              ],
+              "synonyms": [
+                "alert",
+                "flag"
+              ]
+            },
+            {
+              "column_name": "fraud_score",
+              "description": [
+                "Model fraud probability 0-1"
+              ],
+              "synonyms": [
+                "score",
+                "risk score",
+                "model score"
+              ]
+            },
+            {
+              "column_name": "is_fraud",
+              "description": [
+                "1 = fraud, 0 = legitimate (synthetic label)"
+              ]
+            },
+            {
+              "column_name": "payout_method",
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            },
+            {
+              "column_name": "scored_at",
+              "exclude": true
+            },
+            {
+              "column_name": "sequence_number",
+              "description": [
+                "Unique key; transfer_id can repeat across live runs"
+              ]
+            },
+            {
+              "column_name": "ts",
+              "description": [
+                "Transfer time (UTC)"
+              ]
+            }
+          ]
+        },
+        {
+          "identifier": "mlo_serverless_stable_catalog.fraud_rt.silver_login",
+          "description": [
+            "One row per login attempt (synthetic). success=false is a failed login; failure_reason is 'bad_password' or null."
+          ],
+          "column_configs": [
+            {
+              "column_name": "_ingested_at",
+              "exclude": true
+            },
+            {
+              "column_name": "_source_file",
+              "exclude": true
+            },
+            {
+              "column_name": "auth_method",
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            },
+            {
+              "column_name": "device_id",
+              "description": [
+                "Device identifier (PII, masked for non-admins)"
+              ]
+            },
+            {
+              "column_name": "event_ts",
+              "description": [
+                "Login event time (UTC)"
+              ]
+            },
+            {
+              "column_name": "geo_country",
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            },
+            {
+              "column_name": "ip",
+              "description": [
+                "IP address (PII, masked for non-admins)"
+              ]
+            },
+            {
+              "column_name": "partition_key",
+              "exclude": true
+            },
+            {
+              "column_name": "sequence_number",
+              "exclude": true
+            },
+            {
+              "column_name": "success",
+              "description": [
+                "true = successful login, false = failed login"
+              ]
+            }
+          ]
+        },
+        {
+          "identifier": "mlo_serverless_stable_catalog.fraud_rt.silver_otp",
+          "description": [
+            "One row per OTP event (synthetic). status is 'sent', 'failed' or 'verified'. Bursts of failed OTPs are an account-takeover signal."
+          ],
+          "column_configs": [
+            {
+              "column_name": "_ingested_at",
+              "exclude": true
+            },
+            {
+              "column_name": "_source_file",
+              "exclude": true
+            },
+            {
+              "column_name": "device_id",
+              "description": [
+                "Device identifier (PII, masked for non-admins)"
+              ]
+            },
+            {
+              "column_name": "event_ts",
+              "description": [
+                "OTP event time (UTC)"
+              ]
+            },
+            {
+              "column_name": "otp_channel",
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            },
+            {
+              "column_name": "partition_key",
+              "exclude": true
+            },
+            {
+              "column_name": "phone",
+              "description": [
+                "Phone number (PII, masked for non-admins)"
+              ]
+            },
+            {
+              "column_name": "sequence_number",
+              "exclude": true
+            },
+            {
+              "column_name": "status",
+              "description": [
+                "sent, failed or verified"
+              ],
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            }
+          ]
+        },
+        {
+          "identifier": "mlo_serverless_stable_catalog.fraud_rt.silver_screen_view",
+          "description": [
+            "One row per app screen view (synthetic) with dwell time in ms. Rapid hops through security_settings, change_phone and add_recipient are a fraud signal."
+          ],
+          "column_configs": [
+            {
+              "column_name": "_ingested_at",
+              "exclude": true
+            },
+            {
+              "column_name": "_source_file",
+              "exclude": true
+            },
+            {
+              "column_name": "device_id",
+              "description": [
+                "Device identifier (PII, masked for non-admins)"
+              ]
+            },
+            {
+              "column_name": "dwell_ms",
+              "description": [
+                "Time spent on the screen in milliseconds"
+              ]
+            },
+            {
+              "column_name": "event_ts",
+              "description": [
+                "Screen view time (UTC)"
+              ]
+            },
+            {
+              "column_name": "partition_key",
+              "exclude": true
+            },
+            {
+              "column_name": "screen_name",
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            },
+            {
+              "column_name": "sequence_number",
+              "exclude": true
+            }
+          ]
+        },
+        {
+          "identifier": "mlo_serverless_stable_catalog.fraud_rt.silver_transfers",
+          "description": [
+            "One row per cross-border remittance transfer (synthetic). is_fraud is the synthetic ground-truth label (1 = fraud)."
+          ],
+          "column_configs": [
+            {
+              "column_name": "_ingested_at",
+              "exclude": true
+            },
+            {
+              "column_name": "_source_file",
+              "exclude": true
+            },
+            {
+              "column_name": "amount_usd",
+              "description": [
+                "Transfer amount in USD"
+              ],
+              "synonyms": [
+                "amount",
+                "value"
+              ]
+            },
+            {
+              "column_name": "corridor",
+              "description": [
+                "Send-receive country pair, e.g. US-MX"
+              ],
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            },
+            {
+              "column_name": "device_id",
+              "description": [
+                "Device identifier (PII, masked for non-admins)"
+              ]
+            },
+            {
+              "column_name": "ip",
+              "description": [
+                "IP address (PII, masked for non-admins)"
+              ]
+            },
+            {
+              "column_name": "is_fraud",
+              "description": [
+                "1 = fraud, 0 = legitimate (synthetic label)"
+              ],
+              "synonyms": [
+                "fraud flag",
+                "label"
+              ]
+            },
+            {
+              "column_name": "partition_key",
+              "exclude": true
+            },
+            {
+              "column_name": "payout_method",
+              "enable_format_assistance": true,
+              "enable_entity_matching": true
+            },
+            {
+              "column_name": "sequence_number",
+              "exclude": true
+            },
+            {
+              "column_name": "ts",
+              "description": [
+                "Transfer time (UTC)"
+              ],
+              "synonyms": [
+                "transfer time",
+                "transfer date"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "instructions": {
+      "text_instructions": [
+        {
+          "id": "01f0c0de000000000000000000000008",
+          "content": [
+            "This space covers SYNTHETIC data for a cross-border remittance fraud prototype (FE Bar). All tables are in mlo_serverless_stable_catalog.fraud_rt.\n",
+            "- Join tables on customer_id. Transfers use ts for time; login, otp and screen_view use event_ts. All timestamps are UTC.\n",
+            "- Fraud rate = AVG(is_fraud) on silver_transfers, shown as a percentage rounded to 2 decimals. Fraud amount = SUM(amount_usd) where is_fraud = 1.\n",
+            "- A failed login is silver_login.success = false. A failed OTP is silver_otp.status = 'failed'.\n",
+            "- Data is a 30-day backfill plus occasional live bursts, so relative windows (\"last 24 hours\", \"last hour\") should be measured from MAX(event_ts) or MAX(ts) of the table, not from current_timestamp(), unless the user asks for wall-clock time.\n",
+            "- device_id, ip and phone are PII and are masked for non-admin users; count distinct values rather than listing them.\n",
+            "- Corridors: US-MX, US-PH, US-IN, US-GT, US-NG. Payout methods: bank_deposit, cash_pickup, mobile_wallet, home_delivery.\n",
+            "- Round USD amounts to 2 decimals.\n",
+            "- Model scores: use gold_scored_transfers (fraud_score, flagged). Flag precision = flagged fraud / flagged; flag recall = flagged fraud / all fraud. Scores for past transfers are in-sample (the model was refit on all data); say so when reporting model performance.\n",
+            "- For daily or corridor trends prefer gold_daily_fraud_summary; for per-transfer or per-customer questions use gold_scored_transfers or silver tables."
+          ]
+        }
+      ],
+      "example_question_sqls": [
+        {
+          "id": "01f0c0de000000000000000000000009",
+          "question": [
+            "What is the fraud rate by corridor?"
+          ],
+          "sql": [
+            "SELECT corridor, COUNT(*) AS transfers, SUM(is_fraud) AS fraud_transfers,\n",
+            "       ROUND(AVG(is_fraud) * 100, 2) AS fraud_rate_pct,\n",
+            "       ROUND(SUM(CASE WHEN is_fraud = 1 THEN amount_usd ELSE 0 END), 2) AS fraud_amount_usd\n",
+            "FROM mlo_serverless_stable_catalog.fraud_rt.silver_transfers\n",
+            "GROUP BY corridor\n",
+            "ORDER BY fraud_rate_pct DESC"
+          ]
+        },
+        {
+          "id": "01f0c0de00000000000000000000000a",
+          "question": [
+            "Which customers had the most failed OTPs in the last 24 hours?"
+          ],
+          "sql": [
+            "SELECT customer_id, COUNT(*) AS failed_otps, MAX(event_ts) AS last_failed_otp_ts\n",
+            "FROM mlo_serverless_stable_catalog.fraud_rt.silver_otp\n",
+            "WHERE status = 'failed'\n",
+            "  AND event_ts >= (SELECT MAX(event_ts) FROM mlo_serverless_stable_catalog.fraud_rt.silver_otp) - INTERVAL 24 HOURS\n",
+            "GROUP BY customer_id\n",
+            "ORDER BY failed_otps DESC\n",
+            "LIMIT 20"
+          ]
+        },
+        {
+          "id": "01f0c0de00000000000000000000000b",
+          "question": [
+            "Compare average transfer amount for fraud vs legitimate transfers by payout method"
+          ],
+          "sql": [
+            "SELECT payout_method,\n",
+            "       CASE WHEN is_fraud = 1 THEN 'fraud' ELSE 'legitimate' END AS label,\n",
+            "       COUNT(*) AS transfers, ROUND(AVG(amount_usd), 2) AS avg_amount_usd\n",
+            "FROM mlo_serverless_stable_catalog.fraud_rt.silver_transfers\n",
+            "GROUP BY payout_method, label\n",
+            "ORDER BY payout_method, label"
+          ]
+        },
+        {
+          "id": "01f0c0de00000000000000000000000c",
+          "question": [
+            "Do fraud transfers follow failed OTP attempts in the hour before the transfer?"
+          ],
+          "sql": [
+            "WITH t AS (\n",
+            "  SELECT transfer_id, customer_id, ts, is_fraud FROM mlo_serverless_stable_catalog.fraud_rt.silver_transfers\n",
+            "), o AS (\n",
+            "  SELECT t.transfer_id, COUNT(o.event_id) AS failed_otps_1h_before\n",
+            "  FROM t LEFT JOIN mlo_serverless_stable_catalog.fraud_rt.silver_otp o\n",
+            "    ON o.customer_id = t.customer_id AND o.status = 'failed'\n",
+            "   AND o.event_ts >= t.ts - INTERVAL 1 HOUR AND o.event_ts < t.ts\n",
+            "  GROUP BY t.transfer_id\n",
+            ")\n",
+            "SELECT CASE WHEN t.is_fraud = 1 THEN 'fraud' ELSE 'legitimate' END AS label,\n",
+            "       COUNT(*) AS transfers,\n",
+            "       ROUND(AVG(o.failed_otps_1h_before), 3) AS avg_failed_otps_1h_before,\n",
+            "       ROUND(AVG(CASE WHEN o.failed_otps_1h_before > 0 THEN 1 ELSE 0 END) * 100, 2) AS pct_with_failed_otp\n",
+            "FROM t JOIN o USING (transfer_id)\n",
+            "GROUP BY label"
+          ]
+        },
+        {
+          "id": "01f0c0de00000000000000000000000d",
+          "question": [
+            "How many fraud transfers did the model flag, and how many were missed?"
+          ],
+          "sql": [
+            "SELECT SUM(CASE WHEN is_fraud = 1 AND flagged = 1 THEN 1 ELSE 0 END) AS fraud_flagged,\n",
+            "       SUM(CASE WHEN is_fraud = 1 AND flagged = 0 THEN 1 ELSE 0 END) AS fraud_missed,\n",
+            "       SUM(CASE WHEN is_fraud = 0 AND flagged = 1 THEN 1 ELSE 0 END) AS legit_flagged,\n",
+            "       ROUND(SUM(CASE WHEN is_fraud = 1 AND flagged = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(SUM(flagged), 0), 2) AS flag_precision_pct,\n",
+            "       ROUND(SUM(CASE WHEN is_fraud = 1 AND flagged = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(SUM(is_fraud), 0), 2) AS flag_recall_pct\n",
+            "FROM mlo_serverless_stable_catalog.fraud_rt.gold_scored_transfers"
+          ]
+        },
+        {
+          "id": "01f0c0de00000000000000000000000e",
+          "question": [
+            "Which corridors had the most flagged transfers in the last 7 days?"
+          ],
+          "sql": [
+            "SELECT corridor, SUM(flagged_transfers) AS flagged_transfers, SUM(flagged_fraud_transfers) AS flagged_fraud,\n",
+            "       SUM(transfers) AS transfers\n",
+            "FROM mlo_serverless_stable_catalog.fraud_rt.gold_daily_fraud_summary\n",
+            "WHERE day >= (SELECT MAX(day) FROM mlo_serverless_stable_catalog.fraud_rt.gold_daily_fraud_summary) - INTERVAL 7 DAYS\n",
+            "GROUP BY corridor\n",
+            "ORDER BY flagged_transfers DESC"
+          ]
+        },
+        {
+          "id": "01f0c0de00000000000000000000000f",
+          "question": [
+            "Daily transfer volume and fraud count over time"
+          ],
+          "sql": [
+            "SELECT DATE(ts) AS day, COUNT(*) AS transfers, SUM(is_fraud) AS fraud_transfers,\n",
+            "       ROUND(SUM(amount_usd), 2) AS total_amount_usd\n",
+            "FROM mlo_serverless_stable_catalog.fraud_rt.silver_transfers\n",
+            "GROUP BY day\n",
+            "ORDER BY day"
+          ]
+        }
+      ],
+      "join_specs": [
+        {
+          "id": "01f0c0de000000000000000000000010",
+          "left": {
+            "identifier": "mlo_serverless_stable_catalog.fraud_rt.silver_transfers",
+            "alias": "silver_transfers"
+          },
+          "right": {
+            "identifier": "mlo_serverless_stable_catalog.fraud_rt.silver_login",
+            "alias": "silver_login"
+          },
+          "sql": [
+            "`silver_transfers`.`customer_id` = `silver_login`.`customer_id`",
+            "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_MANY--"
+          ]
+        },
+        {
+          "id": "01f0c0de000000000000000000000011",
+          "left": {
+            "identifier": "mlo_serverless_stable_catalog.fraud_rt.silver_transfers",
+            "alias": "silver_transfers"
+          },
+          "right": {
+            "identifier": "mlo_serverless_stable_catalog.fraud_rt.silver_otp",
+            "alias": "silver_otp"
+          },
+          "sql": [
+            "`silver_transfers`.`customer_id` = `silver_otp`.`customer_id`",
+            "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_MANY--"
+          ]
+        },
+        {
+          "id": "01f0c0de000000000000000000000012",
+          "left": {
+            "identifier": "mlo_serverless_stable_catalog.fraud_rt.silver_transfers",
+            "alias": "silver_transfers"
+          },
+          "right": {
+            "identifier": "mlo_serverless_stable_catalog.fraud_rt.silver_screen_view",
+            "alias": "silver_screen_view"
+          },
+          "sql": [
+            "`silver_transfers`.`customer_id` = `silver_screen_view`.`customer_id`",
+            "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_MANY--"
+          ]
+        }
+      ]
+    }
+  }
+}
